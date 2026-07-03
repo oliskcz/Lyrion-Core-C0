@@ -1,0 +1,23 @@
+# Build outputs
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.map
+*.elf
+*.list
+*.cyclo
+*.hex
+*.bin
+
+# STM32CubeIDE / Eclipse
+.cproject
+.project
+.settings/
+
+# Launch files
+*.launch
+
+# Temp files
+*~
