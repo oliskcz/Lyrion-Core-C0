@@ -15,6 +15,7 @@ Release/
 .cproject
 .project
 .settings/
+*.launch
 
 # Launch files
 *.launch

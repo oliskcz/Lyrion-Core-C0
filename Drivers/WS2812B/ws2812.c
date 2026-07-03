@@ -7,7 +7,7 @@
 #define WS2812_LEADING_SLOTS 1
 #define WS2812_PWM_HIGH_0 3
 #define WS2812_PWM_HIGH_1 6
-#define WS2812_Example1_SPEED 50
+#define WS2812_Example1_SPEED 10
 #define WS2812_SCALE_COLOR(value, brightness) \
     ((uint8_t)(((uint16_t)(value) * ((uint16_t)(brightness) + 1U)) >> 8))
 uint8_t hue = 0;

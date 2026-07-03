@@ -18,10 +18,20 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "ws2812.h"
+#include "config.h"
+
+#if ENABLE_WS2812
+	#include "ws2812.h"
+#endif
+#if ENABLE_OLED
+	    #include "ssd1306.h"
+	#include "ssd1306_fonts.h"
+#endif
+//#if ENABLE_TMP102
+	#include "tmp102.h"
+//#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,7 +63,8 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+uint8_t rxByte;
+uint32_t lastTick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -73,6 +84,33 @@ static void MX_NVIC_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Tiny uint-to-string helper for the OLED uptime line (avoids pulling stdio). */
+static int uitoa(uint32_t value, char *out)
+{
+    char tmp[11];
+    int i = 0;
+    int len = 0;
+
+    if (value == 0)
+    {
+        out[0] = '0';
+        return 1;
+    }
+
+    while (value > 0)
+    {
+        tmp[i++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    }
+
+    while (i > 0)
+    {
+        out[len++] = tmp[--i];
+    }
+
+    return len;
+}
 
 /* USER CODE END 0 */
 
@@ -106,19 +144,75 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_I2C1_Init();
-  MX_SPI1_Init();
-  MX_USART1_UART_Init();
-  MX_USART2_UART_Init();
-  MX_ADC1_Init();
-  MX_TIM3_Init();
+  #if ENABLE_UART1
+    MX_USART1_UART_Init();
+  #endif
+  #if ENABLE_UART2
+    MX_USART2_UART_Init();
+  #endif
+  #if ENABLE_SPI
+    MX_SPI1_Init();
+  #endif
+  #if ENABLE_I2C
+    MX_I2C1_Init();
+  #endif
+  #if ENABLE_WS2812
+    MX_TIM3_Init();
+  #endif
+  #if ENABLE_ADC
+    MX_ADC1_Init();
+  #endif
+
+
+
 
   /* Initialize interrupts */
   MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
-  WS2812_Init();
-  WS2812_SetBrightness(0, 64);   // LED 0 at ~25%
-  WS2812_SetBrightness(1, 64);  // LED 1 full brightness
+  #if ENABLE_WS2812
+	  WS2812_Init();
+  #endif
+  #if ENABLE_OLED
+	  ssd1306_Init();
+  #endif
+
+  #if ENABLE_WS2812
+  WS2812_SetBrightness(0, 16);   // LED 0: 32/255 ~ 13%
+  WS2812_SetBrightness(1, 16);   // LED 1: 32/255 ~ 13%
+  #endif
+
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(2, 0);
+  ssd1306_WriteString("Lyrion Core C0", Font_6x8, White);
+  ssd1306_SetCursor(2, 22);
+  ssd1306_WriteString("Hello, World!", Font_6x8, White);
+
+  /* Initial temperature reading on the OLED (line 4). */
+  #if ENABLE_TMP102
+  {
+      int16_t temp = TMP102_ReadTemp(&hi2c1);
+      char tempBuf[10];
+      ssd1306_SetCursor(2, 48);
+      ssd1306_WriteString("Temp: ", Font_6x8, White);
+      if (temp != 9999)
+      {
+          int tlen = uitoa(temp, tempBuf);
+          tempBuf[tlen++] = 0xB0;   /* degree sign in CP437 / ssd1306 6x8 font */
+          tempBuf[tlen++] = 'C';
+          tempBuf[tlen]   = '\0';
+          ssd1306_WriteString(tempBuf, Font_6x8, White);
+      }
+      else
+      {
+          ssd1306_WriteString("ERR", Font_6x8, White);
+      }
+  }
+  #endif
+
+  ssd1306_UpdateScreen();
+
+  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -129,6 +223,71 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	WS2812_Example1();
+
+	if (HAL_GetTick() - lastTick >= 1000)
+	{
+	    lastTick = HAL_GetTick();
+
+	    char msg[] = "Hello, World!\r\n";
+	    HAL_UART_Transmit(&huart1, (uint8_t*)msg, sizeof(msg) - 1, 100);
+
+	    /* Live uptime counter on the OLED (3rd line). */
+	    char buf[8];
+	    int len = uitoa(lastTick / 1000U, buf);
+	    buf[len]     = 's';
+	    buf[len + 1] = '\0';
+
+	    ssd1306_FillRectangle(0, 36, SSD1306_WIDTH - 1, 45, Black);
+		    ssd1306_SetCursor(2, 36);
+		    ssd1306_WriteString("Up: ", Font_6x8, White);
+		    ssd1306_WriteString(buf, Font_6x8, White);
+
+		    /* Live temperature reading on the OLED (line 4). */
+		    #if ENABLE_TMP102
+		    {
+		        int16_t temp = TMP102_ReadTemp(&hi2c1);
+		        char tempBuf[10];
+		        ssd1306_FillRectangle(0, 48, SSD1306_WIDTH - 1, 57, Black);
+		        ssd1306_SetCursor(2, 48);
+		        ssd1306_WriteString("Temp: ", Font_6x8, White);
+		        if (temp != 9999)
+		        {
+		            int tlen = uitoa(temp, tempBuf);
+		            tempBuf[tlen++] = 0xB0;   /* degree sign */
+		            tempBuf[tlen++] = 'C';
+		            tempBuf[tlen]   = '\0';
+		            ssd1306_WriteString(tempBuf, Font_6x8, White);
+		        }
+		        else
+		        {
+		            ssd1306_WriteString("ERR", Font_6x8, White);
+		        }
+		    }
+		    #endif
+		    uint8_t found = 0;
+		    ssd1306_SetCursor(2, 48);
+		    ssd1306_WriteString("I2C:", Font_6x8, White);
+		    const char hex[] = "0123456789ABCDEF";
+		    char addr[5] = "0x00";
+		    for (uint8_t address = 1; address < 128; address++)
+		    {
+		        if (HAL_I2C_IsDeviceReady(&hi2c1, address << 1, 3, 10) == HAL_OK)
+		        {
+		            addr[2] = hex[(address >> 4) & 0x0F];
+		            addr[3] = hex[address & 0x0F];
+
+		            ssd1306_WriteString(" ", Font_6x8, White);
+		            ssd1306_WriteString(addr, Font_6x8, White);
+
+		            found++;
+		        }
+		    }aaa
+		    if (found == 0)
+		    {
+		        ssd1306_WriteString(" X", Font_6x8, White);
+		    }
+		    ssd1306_UpdateScreen();
+	}
   }
   /* USER CODE END 3 */
 }
@@ -178,6 +337,9 @@ static void MX_NVIC_Init(void)
   /* EXTI0_1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+  /* USART1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 /**
@@ -399,9 +561,7 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_AUTOBAUDRATE_INIT;
-  huart1.AdvancedInit.AutoBaudRateEnable = UART_ADVFEATURE_AUTOBAUDRATE_ENABLE;
-  huart1.AdvancedInit.AutoBaudRateMode = UART_ADVFEATURE_AUTOBAUDRATE_ONSTARTBIT;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
     Error_Handler();
@@ -553,6 +713,18 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
   {
     HAL_GPIO_TogglePin(Blink1_GPIO_Port, Blink1_Pin);
   }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        // echo received byte
+        HAL_UART_Transmit(&huart1, &rxByte, 1, 10);
+
+        // restart interrupt reception
+        HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+    }
 }
 /* USER CODE END 4 */
 

@@ -1,0 +1,28 @@
+/*
+ * config.h
+ *
+ *  Created on: 3. 7. 2026
+ *      Author: Oliver Zoller
+ */
+#ifndef CONFIG_H
+#define CONFIG_H
+#endif
+#pragma once
+
+// ===== SETTINGS =====
+#define ENABLE_UART1   1
+#define ENABLE_UART2   0
+#define ENABLE_WS2812  1
+#define ENABLE_OLED    1
+#define ENABLE_ADC     0
+#define ENABLE_I2C     1
+#define ENABLE_TMP102  0
+#define ENABLE_SPI     0
+
+// ===== OLED FONT SETTINGS =====
+#define SSD1306_INCLUDE_FONT_6x8	1
+#define SSD1306_INCLUDE_FONT_7x10	0
+#define SSD1306_INCLUDE_FONT_11x18	0
+#define SSD1306_INCLUDE_FONT_16x26	0
+#define SSD1306_INCLUDE_FONT_16x24	0
+#define SSD1306_INCLUDE_FONT_16x15	0
