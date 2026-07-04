@@ -1,7 +1,15 @@
 #include "ws2812.h"
 
 #include "main.h"
-
+/*
+ * NOTE: The HAL MSP code (stm32c0xx_hal_msp.c) configures the DMA with
+ * DMA_REQUEST_TIM3_CH3, but this driver reconfigures the same DMA handle
+ * to use DMA_REQUEST_TIM3_UP (update event) for precise PWM timing of the
+ * WS2812 protocol.  If you regenerate the project in CubeMX, the MSP init
+ * will be overwritten; re-run WS2812_Init() after HAL_TIM_PWM_MspInit()
+ * to restore the correct DMA request.  The WS2812_Init() call in main()
+ * already handles this.
+ */
 #define WS2812_BITS_PER_LED 24
 #define WS2812_RESET_SLOTS 80
 #define WS2812_LEADING_SLOTS 1

@@ -11,13 +11,10 @@ Release/
 *.hex
 *.bin
 
-# STM32CubeIDE / Eclipse
-.cproject
-.project
+# IDE workspace settings (not project settings)
 .settings/
-*.launch
 
-# Launch files
+# Launch files (debug configurations)
 *.launch
 
 # Temp files

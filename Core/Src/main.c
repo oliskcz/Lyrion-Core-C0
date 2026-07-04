@@ -29,9 +29,9 @@
 	    #include "ssd1306.h"
 	#include "ssd1306_fonts.h"
 #endif
-//#if ENABLE_TMP102
+#if ENABLE_TMP102
 	#include "tmp102.h"
-//#endif
+#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,6 +65,13 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 uint8_t rxByte;
 uint32_t lastTick = 0;
+volatile uint8_t led_event = 0;       /* set to 1 by EXTI callback (LED toggled) */
+#if ENABLE_I2C_SCAN
+uint32_t i2c_scan_lastTick = 0;
+uint32_t i2c_scan_address = 0;   /* 0 = idle, 1-127 = currently scanning */
+uint8_t  i2c_scan_found = 0;    /* device count during current scan */
+uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -78,11 +85,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_NVIC_Init(void);
-/* USER CODE BEGIN PFP */
 
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /* Tiny uint-to-string helper for the OLED uptime line (avoids pulling stdio). */
@@ -108,16 +111,55 @@ static int uitoa(uint32_t value, char *out)
     {
         out[len++] = tmp[--i];
     }
-
     return len;
 }
 
+static const char hex_chars[] = "0123456789ABCDEF";
+
+#if ENABLE_TMP102 && ENABLE_OLED
+/* Draw temperature on OLED line y=24 (blue area). */
+static void oled_show_temp(int16_t temp)
+{
+    char buf[16];
+    ssd1306_SetCursor(2, 24);
+    ssd1306_WriteString("Temp: ", Font_6x8, White);
+
+    if (temp == TMP102_ERROR)
+    {
+        ssd1306_WriteString("ERR", Font_6x8, White);
+        return;
+    }
+
+    /* Handle sign for negative temperatures. */
+    int32_t abs_val = temp;
+    int idx = 0;
+    if (abs_val < 0)
+    {
+        buf[idx++] = '-';
+        abs_val = -abs_val;
+    }
+
+#if TMP102_DECIMAL_PLACES == 0
+    idx += uitoa((uint32_t)abs_val, &buf[idx]);
+#elif TMP102_DECIMAL_PLACES == 1
+    idx += uitoa((uint32_t)(abs_val / 10), &buf[idx]);
+    buf[idx++] = '.';
+    buf[idx++] = (char)('0' + (abs_val % 10));
+#elif TMP102_DECIMAL_PLACES == 2
+    idx += uitoa((uint32_t)(abs_val / 100), &buf[idx]);
+    buf[idx++] = '.';
+    buf[idx++] = (char)('0' + ((abs_val / 10) % 10));
+    buf[idx++] = (char)('0' + (abs_val % 10));
+#endif
+    buf[idx++] = ' ';    /* space before "C" (0xB0 degree sign not in Font6x8) */
+    buf[idx++] = 'C';
+    buf[idx]   = '\0';
+    ssd1306_WriteString(buf, Font_6x8, White);
+}
+#endif
+
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
 
@@ -138,6 +180,30 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  /* If HSE failed to start, fall back to HSI (48 MHz internal oscillator). */
+  if ((RCC->CR & RCC_CR_HSERDY) == 0)
+  {
+      RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+      RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+      RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+      RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+      RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+      if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+      {
+          Error_Handler();
+      }
+
+      RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1;
+      RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+      RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+      RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+      RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+      if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+      {
+          Error_Handler();
+      }
+  }
 
   /* USER CODE END SysInit */
 
@@ -169,6 +235,10 @@ int main(void)
   /* Initialize interrupts */
   MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
+ #if !ENABLE_UART1
+  /* Disable USART1 interrupt if UART1 is not enabled (MX_NVIC_Init enables it unconditionally). */
+  HAL_NVIC_DisableIRQ(USART1_IRQn);
+  #endif
   #if ENABLE_WS2812
 	  WS2812_Init();
   #endif
@@ -181,37 +251,39 @@ int main(void)
   WS2812_SetBrightness(1, 16);   // LED 1: 32/255 ~ 13%
   #endif
 
+  #if ENABLE_OLED
   ssd1306_Fill(Black);
   ssd1306_SetCursor(2, 0);
   ssd1306_WriteString("Lyrion Core C0", Font_6x8, White);
-  ssd1306_SetCursor(2, 22);
+  ssd1306_SetCursor(2, 8);
   ssd1306_WriteString("Hello, World!", Font_6x8, White);
-
-  /* Initial temperature reading on the OLED (line 4). */
-  #if ENABLE_TMP102
-  {
-      int16_t temp = TMP102_ReadTemp(&hi2c1);
-      char tempBuf[10];
-      ssd1306_SetCursor(2, 48);
-      ssd1306_WriteString("Temp: ", Font_6x8, White);
-      if (temp != 9999)
-      {
-          int tlen = uitoa(temp, tempBuf);
-          tempBuf[tlen++] = 0xB0;   /* degree sign in CP437 / ssd1306 6x8 font */
-          tempBuf[tlen++] = 'C';
-          tempBuf[tlen]   = '\0';
-          ssd1306_WriteString(tempBuf, Font_6x8, White);
-      }
-      else
-      {
-          ssd1306_WriteString("ERR", Font_6x8, White);
-      }
-  }
   #endif
 
-  ssd1306_UpdateScreen();
+  #if ENABLE_TMP102
+  TMP102_SetConversionRate(&hi2c1, TMP102_CONV_RATE);
+  #if ENABLE_OLED
+  oled_show_temp(TMP102_ReadTemp(&hi2c1));
+  #endif
+  #endif
 
+  #if ENABLE_OLED
+  ssd1306_SetCursor(2, 32);
+  if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
+      ssd1306_WriteString("Led: ON", Font_6x8, White);
+  else
+      ssd1306_WriteString("Led: OFF", Font_6x8, White);
+  ssd1306_UpdateScreen();
+  #endif
+
+  #if ENABLE_UART1
   HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  #endif
+
+  #if ENABLE_I2C_SCAN
+  /* Kick off the first I2C scan immediately at startup. */
+  i2c_scan_address = 1;
+  i2c_scan_found = 0;
+  #endif
 
   /* USER CODE END 2 */
 
@@ -222,111 +294,129 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	#if ENABLE_WS2812
 	WS2812_Example1();
+	#endif
+
+	/* Instant LED-state feedback (outside 1-second tick). */
+	#if ENABLE_OLED
+	if (led_event)
+	{
+	    led_event = 0;
+	    ssd1306_SetCursor(2, 32);
+	    if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
+	        ssd1306_WriteString("Led: ON", Font_6x8, White);
+	    else
+	        ssd1306_WriteString("Led: OFF", Font_6x8, White);
+	    ssd1306_UpdateScreen();
+	}
+	#endif
 
 	if (HAL_GetTick() - lastTick >= 1000)
 	{
 	    lastTick = HAL_GetTick();
 
-	    char msg[] = "Hello, World!\r\n";
-	    HAL_UART_Transmit(&huart1, (uint8_t*)msg, sizeof(msg) - 1, 100);
+	    #if ENABLE_UART1 && UART_DEBUG
+	    HAL_UART_Transmit(&huart1, (uint8_t *)"Hello, World!\r\n", 15, 100);
+	    #endif
 
-	    /* Live uptime counter on the OLED (3rd line). */
+	    /* Live uptime counter on the OLED (blue, line 1). */
+	    #if ENABLE_OLED
 	    char buf[8];
 	    int len = uitoa(lastTick / 1000U, buf);
 	    buf[len]     = 's';
 	    buf[len + 1] = '\0';
+	    ssd1306_SetCursor(2, 16);
+	    ssd1306_WriteString("Up: ", Font_6x8, White);
+	    ssd1306_WriteString(buf, Font_6x8, White);
+	    #endif
 
-	    ssd1306_FillRectangle(0, 36, SSD1306_WIDTH - 1, 45, Black);
-		    ssd1306_SetCursor(2, 36);
-		    ssd1306_WriteString("Up: ", Font_6x8, White);
-		    ssd1306_WriteString(buf, Font_6x8, White);
+	    #if ENABLE_TMP102 && ENABLE_OLED
+	    oled_show_temp(TMP102_ReadTemp(&hi2c1));
+	    #endif
 
-		    /* Live temperature reading on the OLED (line 4). */
-		    #if ENABLE_TMP102
-		    {
-		        int16_t temp = TMP102_ReadTemp(&hi2c1);
-		        char tempBuf[10];
-		        ssd1306_FillRectangle(0, 48, SSD1306_WIDTH - 1, 57, Black);
-		        ssd1306_SetCursor(2, 48);
-		        ssd1306_WriteString("Temp: ", Font_6x8, White);
-		        if (temp != 9999)
-		        {
-		            int tlen = uitoa(temp, tempBuf);
-		            tempBuf[tlen++] = 0xB0;   /* degree sign */
-		            tempBuf[tlen++] = 'C';
-		            tempBuf[tlen]   = '\0';
-		            ssd1306_WriteString(tempBuf, Font_6x8, White);
-		        }
-		        else
-		        {
-		            ssd1306_WriteString("ERR", Font_6x8, White);
-		        }
-		    }
-		    #endif
-		    uint8_t found = 0;
-		    ssd1306_SetCursor(2, 48);
-		    ssd1306_WriteString("I2C:", Font_6x8, White);
-		    const char hex[] = "0123456789ABCDEF";
-		    char addr[5] = "0x00";
-		    for (uint8_t address = 1; address < 128; address++)
-		    {
-		        if (HAL_I2C_IsDeviceReady(&hi2c1, address << 1, 3, 10) == HAL_OK)
-		        {
-		            addr[2] = hex[(address >> 4) & 0x0F];
-		            addr[3] = hex[address & 0x0F];
+	    #if ENABLE_OLED
+	    ssd1306_SetCursor(2, 32);
+	    if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
+	        ssd1306_WriteString("Led: ON", Font_6x8, White);
+	    else
+	        ssd1306_WriteString("Led: OFF", Font_6x8, White);
+	    #endif
 
-		            ssd1306_WriteString(" ", Font_6x8, White);
-		            ssd1306_WriteString(addr, Font_6x8, White);
-
-		            found++;
-		        }
-		    }aaa
-		    if (found == 0)
-		    {
-		        ssd1306_WriteString(" X", Font_6x8, White);
-		    }
-		    ssd1306_UpdateScreen();
+	    #if ENABLE_I2C_SCAN
+	    /* Start I2C scan if 30 s elapsed and no scan in progress. */
+	    if (i2c_scan_address == 0 && HAL_GetTick() - i2c_scan_lastTick >= 30000)
+	    {
+	        i2c_scan_lastTick = HAL_GetTick();
+	        i2c_scan_address = 1;
+	        i2c_scan_found = 0;
+	        #if ENABLE_UART1 && UART_DEBUG
+	        HAL_UART_Transmit(&huart1, (uint8_t *)"I2C scan...\r\n", 13, 100);
+	        #endif
+	    }
+	    #endif
+	    #if ENABLE_OLED
+	    ssd1306_UpdateScreen();
+	    #endif
 	}
+
+	#if ENABLE_I2C_SCAN
+	/* Non-blocking I2C scan: one address per loop iteration. */
+	if (i2c_scan_address >= 1 && i2c_scan_address < 128)
+	{
+	    uint8_t addr = i2c_scan_address++;
+	    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1), 1, 10) == HAL_OK)
+	    {
+	        if (i2c_scan_found < 16)
+	            i2c_found_addrs[i2c_scan_found] = addr;
+	        i2c_scan_found++;
+	        #if ENABLE_UART1 && UART_DEBUG
+	        char devMsg[] = "  Found 0x00\r\n";
+	        devMsg[9] = hex_chars[(addr >> 4) & 0x0F];
+	        devMsg[10] = hex_chars[addr & 0x0F];
+	        HAL_UART_Transmit(&huart1, (uint8_t *)devMsg, sizeof(devMsg) - 1, 100);
+	        #endif
+	    }
+	    if (i2c_scan_address >= 128)
+	    {
+	        i2c_scan_address = 0;
+	        #if ENABLE_UART1 && UART_DEBUG
+	        HAL_UART_Transmit(&huart1, (uint8_t *)"I2C scan done.\r\n", 16, 100);
+	        #endif
+	        #if ENABLE_OLED
+	        {
+	            char addrStr[5] = "0x00";
+	            ssd1306_SetCursor(2, 56);
+	            ssd1306_WriteString("I2C:", Font_6x8, White);
+	            if (i2c_scan_found > 0)
+	            {
+	                uint8_t show = i2c_scan_found;
+	                if (show > 16) show = 16;
+	                for (uint8_t i = 0; i < show; i++)
+	                {
+	                    uint8_t a = i2c_found_addrs[i];
+	                    addrStr[2] = hex_chars[(a >> 4) & 0x0F];
+	                    addrStr[3] = hex_chars[a & 0x0F];
+	                    ssd1306_WriteString(" ", Font_6x8, White);
+	                    ssd1306_WriteString(addrStr, Font_6x8, White);
+	                }
+	            }
+	            else
+	            {
+	                ssd1306_WriteString(" X", Font_6x8, White);
+	            }
+	        }
+	        #endif
+	        #if ENABLE_OLED
+	        ssd1306_UpdateScreen();
+	        #endif
+	    }
+	}
+	#endif /* ENABLE_I2C_SCAN */
   }
   /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
-  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
 
 /**
   * @brief NVIC Configuration.
@@ -712,9 +802,11 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
   if (GPIO_Pin == UserButton_Pin)
   {
     HAL_GPIO_TogglePin(Blink1_GPIO_Port, Blink1_Pin);
+    led_event = 1;
   }
 }
 
+#if ENABLE_UART1
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
@@ -726,6 +818,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart1, &rxByte, 1);
     }
 }
+#endif
 /* USER CODE END 4 */
 
 /**
@@ -742,6 +835,38 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number

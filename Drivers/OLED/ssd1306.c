@@ -1,5 +1,7 @@
 #include "ssd1306.h"
+#ifdef SSD1306_USE_MATH
 #include <math.h>
+#endif
 #include <stdlib.h>
 #include <string.h>  // For memcpy
 
@@ -315,6 +317,7 @@ void ssd1306_Polyline(const SSD1306_VERTEX *par_vertex, uint16_t par_size, SSD13
     return;
 }
 
+#ifdef SSD1306_USE_MATH
 /* Convert Degrees to Radians */
 static float ssd1306_DegToRad(float par_deg) {
     return par_deg * (3.14f / 180.0f);
@@ -418,8 +421,9 @@ void ssd1306_DrawArcWithRadiusLine(uint8_t x, uint8_t y, uint8_t radius, uint16_
     ssd1306_Line(x,y,xp2,yp2,color);
     return;
 }
+#endif /* SSD1306_USE_MATH */
 
-/* Draw circle by Bresenhem's algorithm */
+/* Draw circle by Breshenhem's algorithm */
 void ssd1306_DrawCircle(uint8_t par_x,uint8_t par_y,uint8_t par_r,SSD1306_COLOR par_color) {
     int32_t x = -par_r;
     int32_t y = 0;

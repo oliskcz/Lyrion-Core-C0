@@ -4,9 +4,6 @@
  *  Created on: 3. 7. 2026
  *      Author: Oliver Zoller
  */
-#ifndef CONFIG_H
-#define CONFIG_H
-#endif
 #pragma once
 
 // ===== SETTINGS =====
@@ -16,8 +13,10 @@
 #define ENABLE_OLED    1
 #define ENABLE_ADC     0
 #define ENABLE_I2C     1
-#define ENABLE_TMP102  0
-#define ENABLE_SPI     0
+#define ENABLE_TMP102  1
+#define ENABLE_SPI     1
+#define ENABLE_I2C_SCAN 1
+#define UART_DEBUG      1
 
 // ===== OLED FONT SETTINGS =====
 #define SSD1306_INCLUDE_FONT_6x8	1
