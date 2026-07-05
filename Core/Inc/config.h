@@ -15,7 +15,9 @@
 #define ENABLE_I2C     1
 #define ENABLE_TMP102  1
 #define ENABLE_SPI     1
-#define ENABLE_I2C_SCAN 1
+#define ENABLE_I2C_SCAN 0
+#define ENABLE_CC1101  1
+#define LYRION_NUM_MODULES 1   /* 1 or 2 — controls radio2 init + loopback test */
 #define UART_DEBUG      1
 
 // ===== OLED FONT SETTINGS =====

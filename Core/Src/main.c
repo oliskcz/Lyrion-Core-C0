@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "config.h"
@@ -31,6 +32,9 @@
 #endif
 #if ENABLE_TMP102
 	#include "tmp102.h"
+#endif
+#if ENABLE_CC1101
+	#include "cc1101.h"
 #endif
 /* USER CODE END Includes */
 
@@ -72,6 +76,20 @@ uint32_t i2c_scan_address = 0;   /* 0 = idle, 1-127 = currently scanning */
 uint8_t  i2c_scan_found = 0;    /* device count during current scan */
 uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
 #endif
+#if ENABLE_CC1101
+cc1101_t radio1;
+#if LYRION_NUM_MODULES >= 2
+cc1101_t radio2;
+#endif
+uint8_t cc1101_ok1 = 0;
+#if LYRION_NUM_MODULES >= 2
+uint8_t cc1101_ok2 = 0;
+#endif
+uint8_t cc1101_regtest = 0;
+uint8_t cc1101_loopback = 0;
+uint32_t cc1101_sync_cnt = 0;    /* sync detections (GDO2 rising) */
+extern volatile uint8_t cc1101_dbg_ver;
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,7 +103,11 @@ static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_NVIC_Init(void);
+/* USER CODE BEGIN PFP */
 
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /* Tiny uint-to-string helper for the OLED uptime line (avoids pulling stdio). */
@@ -160,6 +182,10 @@ static void oled_show_temp(int16_t temp)
 
 /* USER CODE END 0 */
 
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
@@ -210,31 +236,39 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  #if ENABLE_UART1
-    MX_USART1_UART_Init();
-  #endif
-  #if ENABLE_UART2
-    MX_USART2_UART_Init();
+  #if ENABLE_I2C
+  MX_I2C1_Init();
   #endif
   #if ENABLE_SPI
-    MX_SPI1_Init();
+  MX_SPI1_Init();
   #endif
-  #if ENABLE_I2C
-    MX_I2C1_Init();
+  #if ENABLE_UART1
+  MX_USART1_UART_Init();
   #endif
-  #if ENABLE_WS2812
-    MX_TIM3_Init();
+  #if ENABLE_UART2
+  MX_USART2_UART_Init();
   #endif
   #if ENABLE_ADC
-    MX_ADC1_Init();
+  MX_ADC1_Init();
   #endif
-
-
-
+  #if ENABLE_WS2812
+  MX_TIM3_Init();
+  #endif
 
   /* Initialize interrupts */
   MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
+  /* DEBUG: if Blink2 toggles ON at boot, we reached USER CODE BEGIN 2. */
+  HAL_GPIO_WritePin(Blink2_GPIO_Port, Blink2_Pin, GPIO_PIN_SET);
+
+  /* Trigger the first OLED 1-second tick immediately on entering the
+     main loop, so "Up: 0s" and status text appear right away. */
+  lastTick = HAL_GetTick() - 1000;
+
+  #if ENABLE_UART1 && UART_DEBUG
+  HAL_UART_Transmit(&huart1, (uint8_t *)"BOOT\r\n", 6, 100);
+  #endif
+
  #if !ENABLE_UART1
   /* Disable USART1 interrupt if UART1 is not enabled (MX_NVIC_Init enables it unconditionally). */
   HAL_NVIC_DisableIRQ(USART1_IRQn);
@@ -285,6 +319,83 @@ int main(void)
   i2c_scan_found = 0;
   #endif
 
+  #if ENABLE_CC1101
+  {
+      /* Radio 1 — J1 module (CS1=PA11, GDO0_1=PA12, GDO2_1=PB3) */
+      radio1.spi       = &hspi1;
+      radio1.cs_port   = CS1_GPIO_Port;   radio1.cs_pin   = CS1_Pin;
+      radio1.gdo0_port = GDO0_1_GPIO_Port; radio1.gdo0_pin = GDO0_1_Pin;
+      radio1.gdo2_port = GDO2_1_GPIO_Port; radio1.gdo2_pin = GDO2_1_Pin;
+      cc1101_ok1 = CC1101_Init(&radio1, CC1101_BAND_433, CC1101_MOD_GFSK_38_4KB);
+
+      #if LYRION_NUM_MODULES >= 2
+      /* Radio 2 — J3 module (CS2=PC6, GDO0_2=PA2, GDO2_2=PA15) */
+      radio2.spi       = &hspi1;
+      radio2.cs_port   = CS2_GPIO_Port;   radio2.cs_pin   = CS2_Pin;
+      radio2.gdo0_port = GDO0_2_GPIO_Port; radio2.gdo0_pin = GDO0_2_Pin;
+      radio2.gdo2_port = GDO2_2_GPIO_Port; radio2.gdo2_pin = GDO2_2_Pin;
+      cc1101_ok2 = CC1101_Init(&radio2, CC1101_BAND_433, CC1101_MOD_GFSK_38_4KB);
+      #endif
+
+      /* Register readback test: write 0x5A to FREQ0, read back.
+         FREQ0 is fully read/write with no reserved bits (unlike IOCFGx). */
+      if (cc1101_ok1) {
+          uint8_t saved = CC1101_ReadReg(&radio1, CC1101_FREQ0);
+          CC1101_WriteReg(&radio1, CC1101_FREQ0, 0x5A);
+          uint8_t rb = CC1101_ReadReg(&radio1, CC1101_FREQ0);
+          cc1101_regtest = (rb == 0x5A) ? 1 : 0;
+          CC1101_WriteReg(&radio1, CC1101_FREQ0, saved);
+      }
+
+      #if LYRION_NUM_MODULES >= 2
+      /* TX/RX loopback: radio1 → radio2 */
+      if (cc1101_ok1 && cc1101_ok2) {
+          const uint8_t test_pkt[] = "CC1101!";
+          CC1101_SetRx(&radio2);
+          CC1101_FlushTx(&radio1);
+          uint8_t sent = CC1101_SendPacket(&radio1, test_pkt, sizeof(test_pkt));
+
+          if (sent) {
+              uint32_t deadline = HAL_GetTick() + 50;
+              uint8_t rxbuf[32];
+              uint8_t rlen = 0;
+              do {
+                  rlen = CC1101_ReceivePacket(&radio2, rxbuf, sizeof(rxbuf), 0);
+                  if (rlen > 0) break;
+              } while (HAL_GetTick() < deadline);
+
+              if (rlen == sizeof(test_pkt)) {
+                  uint8_t match = 1;
+                  for (uint8_t i = 0; i < rlen; i++)
+                      if (rxbuf[i] != test_pkt[i]) { match = 0; break; }
+                  cc1101_loopback = match ? 1 : 2;
+              } else {
+                  cc1101_loopback = 2;
+              }
+          } else {
+              cc1101_loopback = 2;
+          }
+
+          #if ENABLE_UART1 && UART_DEBUG
+          char dbg[] = "LPBK: OK\r\n";
+          if (cc1101_loopback == 2) { dbg[5] = 'F'; dbg[6] = 'A'; dbg[7] = 'I'; dbg[8] = 'L'; dbg[9] = '\r'; dbg[10] = '\n'; dbg[11] = 0; }
+          HAL_UART_Transmit(&huart1, (uint8_t*)dbg, cc1101_loopback == 1 ? 10 : 12, 100);
+          #endif
+      }
+      #endif
+
+      /* Enter RX for normal operation. */
+      if (cc1101_ok1) CC1101_SetRx(&radio1);
+      #if LYRION_NUM_MODULES >= 2
+      if (cc1101_ok2) CC1101_SetRx(&radio2);
+      #endif
+
+      /* CC1101_Init above wrote IOCFG=0x06, disabling the 26 MHz clock
+         output on GDO0/GDO2.  Now safe to unmask EXTI for packet RX. */
+      EXTI->IMR1 |= GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
+  }
+  #endif
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -294,6 +405,42 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	#if ENABLE_CC1101
+	/* Interrupt-driven RX: EXTI handler set rx_ready; read FIFO here. */
+	if (radio1.sync_seen) {
+	    radio1.sync_seen = 0;
+	    cc1101_sync_cnt++;
+	}
+	#if LYRION_NUM_MODULES >= 2
+	if (radio2.sync_seen) {
+	    radio2.sync_seen = 0;
+	    cc1101_sync_cnt++;
+	}
+	#endif
+	if (radio1.rx_ready) {
+	    radio1.rx_ready = 0;
+	    uint8_t rxbuf[64];
+	    int8_t rssi;
+	    uint8_t n = CC1101_ReceivePacket(&radio1, rxbuf, sizeof(rxbuf), &rssi);
+	    if (n > 0) {
+	        #if ENABLE_UART1 && UART_DEBUG
+	        char dbg[] = "RX 0B\r\n";
+	        dbg[3] = hex_chars[(n >> 4) & 0xF];
+	        dbg[4] = hex_chars[n & 0xF];
+	        HAL_UART_Transmit(&huart1, (uint8_t*)dbg, 7, 100);
+	        #endif
+	    }
+	}
+	#if LYRION_NUM_MODULES >= 2
+	if (radio2.rx_ready) {
+	    radio2.rx_ready = 0;
+	    uint8_t rxbuf[64];
+	    int8_t rssi;
+	    CC1101_ReceivePacket(&radio2, rxbuf, sizeof(rxbuf), &rssi);
+	}
+	#endif
+	#endif
+
 	#if ENABLE_WS2812
 	WS2812_Example1();
 	#endif
@@ -341,6 +488,31 @@ int main(void)
 	        ssd1306_WriteString("Led: ON", Font_6x8, White);
 	    else
 	        ssd1306_WriteString("Led: OFF", Font_6x8, White);
+	    #endif
+
+	    #if ENABLE_CC1101 && ENABLE_OLED
+	    ssd1306_SetCursor(2, 40);
+	    ssd1306_WriteString("R1:", Font_6x8, White);
+	    ssd1306_WriteString(cc1101_ok1 ? "OK " : "FAIL", Font_6x8, White);
+	    #if LYRION_NUM_MODULES >= 2
+	    ssd1306_WriteString("R2:", Font_6x8, White);
+	    ssd1306_WriteString(cc1101_ok2 ? "OK " : "FAIL", Font_6x8, White);
+	    #endif
+
+	    ssd1306_SetCursor(2, 48);
+	    ssd1306_WriteString("REG:", Font_6x8, White);
+	    ssd1306_WriteString(cc1101_regtest ? "OK " : "FAIL", Font_6x8, White);
+	    /* Sync detections (GDO2 rising edge) */
+	    {
+	        char s[8];
+	        s[0] = ' '; s[1] = 'S'; s[2] = 'Y'; s[3] = ':';
+	        uint32_t n = cc1101_sync_cnt;
+	        s[7] = 0;
+	        s[6] = (char)('0' + n % 10); n /= 10;
+	        s[5] = (char)('0' + n % 10); n /= 10;
+	        s[4] = (char)('0' + n % 10);
+	        ssd1306_WriteString(s, Font_6x8, White);
+	    }
 	    #endif
 
 	    #if ENABLE_I2C_SCAN
@@ -417,6 +589,41 @@ int main(void)
   /* USER CODE END 3 */
 }
 
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
 
 /**
   * @brief NVIC Configuration.
@@ -430,6 +637,12 @@ static void MX_NVIC_Init(void)
   /* USART1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
+  /* EXTI4_15_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+  /* EXTI2_3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
 }
 
 /**
@@ -573,6 +786,39 @@ static void MX_SPI1_Init(void)
   }
   /* USER CODE BEGIN SPI1_Init 2 */
 
+  /* Dynamic SPI clock: if HSE failed (HSI fallback, 48 MHz), prescaler 2
+     would give 24 MHz SPI — the CC1101 max is 10 MHz, causing bit errors.
+     Adjust the prescaler so SPI ≤ 6 MHz regardless of system clock.
+     Run this FIRST because HAL_SPI_Init below would re-call HAL_SPI_MspInit
+     which resets GPIO speed to LOW — so we fix GPIO speed AFTER. */
+  {
+      uint32_t apb1 = HAL_RCC_GetPCLK1Freq();
+      uint32_t br_val = (hspi1.Instance->CR1 & SPI_CR1_BR) >> SPI_CR1_BR_Pos;
+      uint32_t divisor = 2u << br_val;  /* 0→2, 1→4, 2→8, 3→16, … */
+      uint32_t spi_speed = apb1 / divisor;
+      if (spi_speed > 10000000) {
+          hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+          __HAL_SPI_DISABLE(&hspi1);
+          HAL_SPI_Init(&hspi1);
+          __HAL_SPI_ENABLE(&hspi1);
+      }
+  }
+
+  /* Reconfigure SPI GPIO pins to HIGH speed AFTER any potential re-init
+     above (HAL_SPI_Init resets speed to LOW via HAL_SPI_MspInit). */
+  {
+      GPIO_InitTypeDef GPIO_InitStruct = {0};
+      GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+      GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+      GPIO_InitStruct.Pull = GPIO_NOPULL;
+      GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+      GPIO_InitStruct.Alternate = GPIO_AF0_SPI1;
+      HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  }
+
+  /* Disable NSS pulse mode.  NSSP can cause inter-byte NSS pulses that
+     confuse the CC1101 SPI state machine during burst writes. */
+  CLEAR_BIT(hspi1.Instance->CR2, SPI_CR2_NSSP);
   /* USER CODE END SPI1_Init 2 */
 
 }
@@ -752,16 +998,16 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CS1_GPIO_Port, CS1_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : UserButton_Pin */
-  GPIO_InitStruct.Pin = UserButton_Pin;
+  /*Configure GPIO pins : UserButton_Pin GDO2_2_Pin */
+  GPIO_InitStruct.Pin = UserButton_Pin|GDO2_2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(UserButton_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GDO0_2_Pin GDO0_1_Pin GDO2_2_Pin */
-  GPIO_InitStruct.Pin = GDO0_2_Pin|GDO0_1_Pin|GDO2_2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  /*Configure GPIO pins : GDO0_2_Pin GDO0_1_Pin */
+  GPIO_InitStruct.Pin = GDO0_2_Pin|GDO0_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : CS3_Pin Blink2_Pin Blink1_Pin */
@@ -787,12 +1033,54 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : GDO2_1_Pin */
   GPIO_InitStruct.Pin = GDO2_1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GDO2_1_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Keep CubeMX's EXTI config (IT_FALLING/IT_RISING) but add PULLDOWN
+     and mask IMR1.  The CC1101 defaults to outputting a 26 MHz clock
+     on GDO0/GDO2 after power-on — if EXTI is unmasked before IOCFG
+     is written (in CC1101_Init), the 26 MHz edges cause instant ISR
+     livelock and the system never reaches USER CODE.
+     We'll unmask IMR1 in USER CODE BEGIN 2 after CC1101_Init. */
+  GPIO_InitStruct.Pin = GDO0_2_Pin|GDO0_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  GPIO_InitStruct.Pin = GDO2_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GDO2_2_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GDO2_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GDO2_1_GPIO_Port, &GPIO_InitStruct);
+
+  /* Mask EXTI at the peripheral level — will unmask after CC1101 init
+     has written IOCFG to disable the clock output on GDO0/GDO2. */
+  EXTI->IMR1 &= ~(GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin);
+  EXTI->RPR1  =  GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
+  EXTI->FPR1  =  GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
+
+  /* CS pins: drive HIGH and add PULLUP, so CS stays deasserted during
+     STM32 reset (CC1101 has no HW reset line). */
+  HAL_GPIO_WritePin(CS1_GPIO_Port, CS1_Pin, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin = CS1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CS1_GPIO_Port, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(CS2_GPIO_Port, CS2_Pin, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin = CS2_Pin;
+  HAL_GPIO_Init(CS2_GPIO_Port, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(CS3_GPIO_Port, CS3_Pin, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin = CS3_Pin;
+  HAL_GPIO_Init(CS3_GPIO_Port, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -804,7 +1092,25 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
     HAL_GPIO_TogglePin(Blink1_GPIO_Port, Blink1_Pin);
     led_event = 1;
   }
+  #if ENABLE_CC1101
+  /* GDO2 pins: "sync word detected" — set flag only (no SPI in ISR). */
+  if (radio1.spi) CC1101_HandleGdo2(&radio1, GPIO_Pin);
+  #if LYRION_NUM_MODULES >= 2
+  if (radio2.spi) CC1101_HandleGdo2(&radio2, GPIO_Pin);
+  #endif
+  #endif
 }
+
+#if ENABLE_CC1101
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
+{
+  /* GDO0 pins: "packet RX done" — set rx_ready, no SPI in ISR. */
+  if (radio1.spi) CC1101_HandleGdo0(&radio1, GPIO_Pin);
+  #if LYRION_NUM_MODULES >= 2
+  if (radio2.spi) CC1101_HandleGdo0(&radio2, GPIO_Pin);
+  #endif
+}
+#endif
 
 #if ENABLE_UART1
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -835,38 +1141,6 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
-  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number

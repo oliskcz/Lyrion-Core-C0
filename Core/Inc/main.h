@@ -66,6 +66,7 @@ void Error_Handler(void);
 #define UserButton_EXTI_IRQn EXTI0_1_IRQn
 #define GDO0_2_Pin GPIO_PIN_2
 #define GDO0_2_GPIO_Port GPIOA
+#define GDO0_2_EXTI_IRQn EXTI2_3_IRQn
 #define WS2812B_Pin GPIO_PIN_0
 #define WS2812B_GPIO_Port GPIOB
 #define CS3_Pin GPIO_PIN_1
@@ -76,10 +77,13 @@ void Error_Handler(void);
 #define CS1_GPIO_Port GPIOA
 #define GDO0_1_Pin GPIO_PIN_12
 #define GDO0_1_GPIO_Port GPIOA
+#define GDO0_1_EXTI_IRQn EXTI4_15_IRQn
 #define GDO2_2_Pin GPIO_PIN_15
 #define GDO2_2_GPIO_Port GPIOA
+#define GDO2_2_EXTI_IRQn EXTI4_15_IRQn
 #define GDO2_1_Pin GPIO_PIN_3
 #define GDO2_1_GPIO_Port GPIOB
+#define GDO2_1_EXTI_IRQn EXTI2_3_IRQn
 #define Blink2_Pin GPIO_PIN_4
 #define Blink2_GPIO_Port GPIOB
 #define Blink1_Pin GPIO_PIN_5
