@@ -1,177 +1,130 @@
-# STM32 Lyrion Core C0 - Lyrion Link M1 / STM32C031 Peripheral Test Platform
+# STM32 Lyrion Core C0
 
-## Overview
-
-This project is based on the **STM32C031G6U6TR** microcontroller and serves as the firmware for the **Lyrion Core C0 development board**.
-
-The board is designed as:
-- A carrier platform for **2× Lyrion Link M1 Lite H / L modules**
-- A general-purpose STM32C031 test and validation board for future PCB designs
-
-It provides access to multiple peripherals for testing and prototyping:
-- 1× User button (`UserButton`)
-- 2× User LEDs (`Blink1`, `Blink2`)
-- USB-UART bridge via **CH340 (USART1)**
-- Exposed **USART2 header**
-- Exposed **I2C interface**
-- 0.96" I2C OLED (128×64) support header
-- Exposed **SPI interface**
-- 2× WS2812B addressable LEDs on pin `WS2812B`
-- Boot button and reset button
-- **TMP102AIDRLR I2C temperature sensor**
+Firmware for the **Lyrion Core C0 development board** — an **STM32C031G6UX**-based platform for prototyping with **CC1101 sub-1 GHz RF modules** (Lyrion Link series), I2C OLED, temperature sensing, and addressable LEDs.
 
 ---
 
-## WS2812 Driver Module
+## Board Features
 
-The WS2812 driver is implemented using:
-- TIM3 PWM output (Channel 3)
-- DMA-based transmission
-- ~800 kHz timing base
-
----
-
-## API Functions
-
-```
-void WS2812_Init(void);
-void WS2812_SetLED(uint8_t led, uint8_t red, uint8_t green, uint8_t blue);
-void WS2812_SetBrightness(uint8_t led, uint8_t brightness);
-void WS2812_Send(void);
-void WS2812_Example1(void);
-```
+| Peripheral | Interface | Driver |
+|-----------|-----------|--------|
+| **CC1101 module J1** (header) | SPI1 (PA5/PA6/PA7), CS1=PA11, GDO0=PA12, GDO2=PB3 | `Drivers/CC1101/cc1101.c` |
+| **CC1101 module J3** (header) | SPI1 (shared), CS2=PC6, GDO0=PA2, GDO2=PA15 | same (multi-instance) |
+| **0.96" OLED 128×64** | I2C1 (PB7/PB8), addr 0x3C | `Drivers/OLED/ssd1306.c` |
+| **TMP102 temperature sensor** | I2C1 (shared), addr 0x48 | `Drivers/TMP102/tmp102.c` |
+| **2× WS2812B RGB LEDs** | TIM3_CH3 PWM + DMA | `Drivers/WS2812B/ws2812.c` |
+| **USB-UART bridge** (CH340) | USART1 (PB6/PB7) | CubeMX HAL |
+| **User button** | PA1 (EXTI0_1 rising) | main.c callback |
+| **2× user LEDs** | Blink1=PB5, Blink2=PB4 | GPIO output |
 
 ---
 
-## Configuration Macros (ws2812.c)
+## CC1101 Driver (`Drivers/CC1101/`)
 
-These values control timing and animation behavior:
+Multi-instance SPI driver for the **CC1101 sub-1 GHz transceiver** (26 MHz crystal, GFSK/OOK/2-FSK/4-FSK).
 
-```
-#define WS2812_BITS_PER_LED      24
-#define WS2812_RESET_SLOTS       80
-#define WS2812_LEADING_SLOTS     1
-#define WS2812_PWM_HIGH_0        3
-#define WS2812_PWM_HIGH_1        6
-#define WS2812_Example1_SPEED    50
-```
+**Key features:**
+- Polling or **EXTI-driven RX** (GDO0 falling = packet ready, GDO2 rising = sync detected)
+- CHIP_RDYn handshake with timeout
+- Dynamic SPI prescaler (safe under HSI 48 MHz fallback)
+- Frequency synthesis, channel grid, TX power control (PATABLE)
+- Variable-length packets with hardware CRC
 
-Notes:
-- PWM resolution depends on TIM3 ARR configuration
-- TIM3 is configured for ~800 kHz WS2812 timing
-- DMA is used for continuous bitstream generation
-- Reset time must exceed 50 µs
+**Status displayed on OLED:**
+- `R1:OK` / `R2:OK` — radio init status
+- `REG:OK` — SPI register readback test
+- `SY:nnn` — sync detection counter (GDO2)
 
----
-
-## ws2812.h Configuration
-
-```
-#define WS2812_LED_COUNT 2
-```
-
-This defines the number of WS2812 LEDs in the chain.
-
----
-
-## Typical Usage
-
-### Initialization
-```
-WS2812_Init();
-```
-
-### Set LED Color
-```
-WS2812_SetLED(0, 255, 0, 0);   // LED 0 = Red
-WS2812_SetLED(1, 0, 255, 0);   // LED 1 = Green
-```
-
-### Set Brightness
-```
-WS2812_SetBrightness(0, 64);   // LED 0 ~25%
-WS2812_SetBrightness(1, 255);  // LED 1 full brightness
-```
-
-### Send Data to LEDs
-```
-WS2812_Send();
+**Config (`config.h`):**
+```c
+#define ENABLE_CC1101  1            // enable the driver
+#define LYRION_NUM_MODULES 1        // 1 or 2 radios
 ```
 
 ---
 
-## Example Animation Loop
+## Display (OLED 128×64)
+
+Updated once per second via the main loop 1-second tick:
 
 ```
-while (1)
-{
-    WS2812_Example1();
-}
+Lyrion Core C0
+Hello, World!
+Up: 123s        ← uptime
+Temp: 24.5 C    ← TMP102
+Led: ON         ← Blink1 state
+R1:OK           ← radio init
+REG:OK SY:042   ← register test + sync count
 ```
-
-This function:
-- Converts a hue value into RGB
-- Applies a color offset between LEDs
-- Generates a smooth rainbow effect
-- Uses DMA for minimal CPU usage
-- Runs continuously for animation
 
 ---
 
-## Hardware Configuration
+## Configuration (`Core/Inc/config.h`)
 
-### Timer Setup (WS2812)
-- Timer: TIM3
-- Channel: CH3
-- Mode: PWM + DMA
-- Target frequency: ~800 kHz
-
-### Critical Requirements
-- Timing must be precise for WS2812 protocol
-- DMA transfer must not be interrupted
-- Reset pulse must be >50 µs low signal
+| Macro | Default | Purpose |
+|-------|---------|---------|
+| `ENABLE_UART1` | 1 | USB-UART bridge |
+| `ENABLE_WS2812` | 1 | Addressable LEDs |
+| `ENABLE_OLED` | 1 | I2C OLED display |
+| `ENABLE_TMP102` | 1 | Temperature sensor |
+| `ENABLE_SPI` | 1 | SPI1 for CC1101 |
+| `ENABLE_CC1101` | 1 | CC1101 radio driver |
+| `LYRION_NUM_MODULES` | 1 | Number of CC1101 modules (1 or 2) |
+| `UART_DEBUG` | 1 | UART diagnostic messages |
+| `LYRION_XTAL_HZ` | 26000000 | CC1101 reference crystal (verify on module) |
 
 ---
 
 ## File Structure
 
-Recommended STM32CubeIDE structure:
-
 ```
 Core/
  ├── Inc/
- │    ├── ws2812.h
- │    └── main.h
- │
+ │    ├── config.h          — feature toggles
+ │    ├── main.h            — pin definitions
+ │    ├── stm32c0xx_it.h    — IRQ declarations
+ │    └── ...
  ├── Src/
- │    ├── main.c
- │    ├── ws2812.c
- │    └── stm32c0xx_it.c
+ │    ├── main.c            — init loop, EXTI callbacks, OLED display
+ │    ├── stm32c0xx_it.c    — EXTI/UART/DMA IRQ handlers
+ │    └── ...
+Drivers/
+ ├── CC1101/
+ │    ├── cc1101.h          — register map, API, driver instance struct
+ │    └── cc1101.c          — SPI access, frequency/channel/power, TX/RX
+ ├── OLED/
+ │    ├── ssd1306.c         — I2C OLED controller
+ │    └── ssd1306.h
+ ├── TMP102/
+ │    ├── tmp102.c          — I2C temperature sensor
+ │    └── tmp102.h
+ └── WS2812B/
+      ├── ws2812.c          — PWM+DMA addressable LED driver
+      └── ws2812.h
 ```
 
 ---
 
-## Recommended Usage Notes
+## EXTI Interrupts
 
-- Do not modify generated HAL files outside `USER CODE` sections
-- Keep all WS2812 logic inside `ws2812.c`
-- Ensure DMA interrupts are enabled for TIM3
-- Always call `WS2812_Send()` after updating LED data
+| Pin | Signal | Edge | Purpose |
+|-----|--------|------|---------|
+| PA1 | UserButton | rising | Button press |
+| PA2 | GDO0_2 (J3) | falling | Packet RX done |
+| PA12 | GDO0_1 (J1) | falling | Packet RX done |
+| PB3 | GDO2_1 (J1) | rising | Sync detected |
+| PA15 | GDO2_2 (J3) | rising | Sync detected |
+
+EXTI interrupts are **masked during boot** (`EXTI->IMR1`) to prevent the CC1101's default 26 MHz clock output from causing an ISR livelock. They are unmasked in `USER CODE BEGIN 2` after `CC1101_Init()` has written `IOCFG=0x06` to disable the clock output.
 
 ---
 
-## Project Purpose
+## Building
 
-This firmware is intended for:
-
-- Hardware bring-up validation
-- Peripheral testing (UART, I2C, SPI, ADC, PWM, DMA)
-- WS2812 RGB LED control experiments
-- RF module integration testing (Lyrion Link series)
-- STM32C031G6U6TR evaluation platform development
+Open the project in **STM32CubeIDE** (the `.cproject` / `.project` files are included). Build the **Debug** configuration and flash via the on-board debugger (SWD) or USB-UART bootloader.
 
 ---
 
 ## License
 
-This project uses **STMicroelectronics HAL drivers** and follows their licensing terms included in STM32CubeIDE.
+STMicroelectronics HAL drivers are used under ST's license terms (included with STM32CubeIDE).
