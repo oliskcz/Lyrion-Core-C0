@@ -35,7 +35,9 @@
 #endif
 #if ENABLE_CC1101
 	#include "cc1101.h"
+	#include "cc1101_port.h"
 #endif
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,21 +78,20 @@ uint32_t i2c_scan_address = 0;   /* 0 = idle, 1-127 = currently scanning */
 uint8_t  i2c_scan_found = 0;    /* device count during current scan */
 uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
 #endif
-#if ENABLE_CC1101
-cc1101_t radio1;
-#if LYRION_NUM_MODULES >= 2
-cc1101_t radio2;
-#endif
-uint8_t cc1101_ok1 = 0;
-#if LYRION_NUM_MODULES >= 2
-uint8_t cc1101_ok2 = 0;
-#endif
-uint8_t cc1101_regtest = 0;
-uint8_t cc1101_loopback = 0;
-uint32_t cc1101_sync_cnt = 0;    /* sync detections (GDO2 rising) */
-extern volatile uint8_t cc1101_dbg_ver;
-#endif
-/* USER CODE END PV */
+  #if ENABLE_CC1101
+  #if CC1101_ENABLE_RADIO1
+  cc1101_t radio1;
+  #endif
+  #if CC1101_ENABLE_RADIO2
+  cc1101_t radio2;
+  #endif
+  static cc1101_t *cc1101_radio1     = NULL;
+  static char       cc1101_rx_msg[22];
+  static int8_t     cc1101_rx_rssi   = 0;
+  static uint8_t    cc1101_rx_lqi    = 0;
+  static volatile bool cc1101_rx_ready = false;
+  #endif
+  /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -143,7 +144,7 @@ static const char hex_chars[] = "0123456789ABCDEF";
 static void oled_show_temp(int16_t temp)
 {
     char buf[16];
-    ssd1306_SetCursor(2, 24);
+    ssd1306_SetCursor(2, 8);
     ssd1306_WriteString("Temp: ", Font_6x8, White);
 
     if (temp == TMP102_ERROR)
@@ -176,6 +177,44 @@ static void oled_show_temp(int16_t temp)
     buf[idx++] = ' ';    /* space before "C" (0xB0 degree sign not in Font6x8) */
     buf[idx++] = 'C';
     buf[idx]   = '\0';
+    ssd1306_WriteString(buf, Font_6x8, White);
+}
+#endif
+
+#if ENABLE_CC1101
+/* Called from EXTI (rising edge on GDO0) — must be tiny, just set a flag. */
+static void on_cc1101_rx_data(void)
+{
+    cc1101_rx_ready = true;
+}
+#endif
+
+#if ENABLE_CC1101 && ENABLE_OLED
+static void oled_show_rx(const char *msg, int8_t rssi, uint8_t lqi)
+{
+    char buf[22];
+
+    ssd1306_FillRectangle(2, 16, 127, 31, Black);
+
+    /* Line 2 (y=16): message */
+    ssd1306_SetCursor(2, 16);
+    ssd1306_WriteString("RX: ", Font_6x8, White);
+    ssd1306_WriteString((char *)msg, Font_6x8, White);
+
+    /* Line 3 (y=24): RSSI and LQI */
+    ssd1306_SetCursor(2, 24);
+    int idx = 0;
+    static const char rp[] = "RSSI: ";
+    for (; idx < (int)sizeof(rp) - 1; idx++) buf[idx] = rp[idx];
+    int32_t abs_rssi = (rssi < 0) ? -rssi : rssi;
+    if (rssi < 0) buf[idx++] = '-';
+    idx += uitoa((uint32_t)abs_rssi, &buf[idx]);
+    buf[idx++] = ' ';
+    buf[idx++] = 'd'; buf[idx++] = 'B'; buf[idx++] = 'm';
+    buf[idx++] = ' '; buf[idx++] = ' ';
+    buf[idx++] = 'L'; buf[idx++] = 'Q'; buf[idx++] = 'I'; buf[idx++] = ':';
+    idx += uitoa(lqi, &buf[idx]);
+    buf[idx] = '\0';
     ssd1306_WriteString(buf, Font_6x8, White);
 }
 #endif
@@ -258,11 +297,8 @@ int main(void)
   /* Initialize interrupts */
   MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
-  /* DEBUG: if Blink2 toggles ON at boot, we reached USER CODE BEGIN 2. */
-  HAL_GPIO_WritePin(Blink2_GPIO_Port, Blink2_Pin, GPIO_PIN_SET);
-
   /* Trigger the first OLED 1-second tick immediately on entering the
-     main loop, so "Up: 0s" and status text appear right away. */
+     main loop, so status text appears right away. */
   lastTick = HAL_GetTick() - 1000;
 
   #if ENABLE_UART1 && UART_DEBUG
@@ -289,8 +325,6 @@ int main(void)
   ssd1306_Fill(Black);
   ssd1306_SetCursor(2, 0);
   ssd1306_WriteString("Lyrion Core C0", Font_6x8, White);
-  ssd1306_SetCursor(2, 8);
-  ssd1306_WriteString("Hello, World!", Font_6x8, White);
   #endif
 
   #if ENABLE_TMP102
@@ -301,11 +335,6 @@ int main(void)
   #endif
 
   #if ENABLE_OLED
-  ssd1306_SetCursor(2, 32);
-  if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
-      ssd1306_WriteString("Led: ON", Font_6x8, White);
-  else
-      ssd1306_WriteString("Led: OFF", Font_6x8, White);
   ssd1306_UpdateScreen();
   #endif
 
@@ -320,79 +349,78 @@ int main(void)
   #endif
 
   #if ENABLE_CC1101
+  /* SPI MISO pin for waitReady() polling (PA6 on this board). */
+  #define CC1101_MISO_PORT  GPIOA
+  #define CC1101_MISO_PIN   GPIO_PIN_6
   {
-      /* Radio 1 — J1 module (CS1=PA11, GDO0_1=PA12, GDO2_1=PB3) */
-      radio1.spi       = &hspi1;
-      radio1.cs_port   = CS1_GPIO_Port;   radio1.cs_pin   = CS1_Pin;
-      radio1.gdo0_port = GDO0_1_GPIO_Port; radio1.gdo0_pin = GDO0_1_Pin;
-      radio1.gdo2_port = GDO2_1_GPIO_Port; radio1.gdo2_pin = GDO2_1_Pin;
-      cc1101_ok1 = CC1101_Init(&radio1, CC1101_BAND_433, CC1101_MOD_GFSK_38_4KB);
-
-      #if LYRION_NUM_MODULES >= 2
-      /* Radio 2 — J3 module (CS2=PC6, GDO0_2=PA2, GDO2_2=PA15) */
-      radio2.spi       = &hspi1;
-      radio2.cs_port   = CS2_GPIO_Port;   radio2.cs_pin   = CS2_Pin;
-      radio2.gdo0_port = GDO0_2_GPIO_Port; radio2.gdo0_pin = GDO0_2_Pin;
-      radio2.gdo2_port = GDO2_2_GPIO_Port; radio2.gdo2_pin = GDO2_2_Pin;
-      cc1101_ok2 = CC1101_Init(&radio2, CC1101_BAND_433, CC1101_MOD_GFSK_38_4KB);
-      #endif
-
-      /* Register readback test: write 0x5A to FREQ0, read back.
-         FREQ0 is fully read/write with no reserved bits (unlike IOCFGx). */
-      if (cc1101_ok1) {
-          uint8_t saved = CC1101_ReadReg(&radio1, CC1101_FREQ0);
-          CC1101_WriteReg(&radio1, CC1101_FREQ0, 0x5A);
-          uint8_t rb = CC1101_ReadReg(&radio1, CC1101_FREQ0);
-          cc1101_regtest = (rb == 0x5A) ? 1 : 0;
-          CC1101_WriteReg(&radio1, CC1101_FREQ0, saved);
-      }
-
-      #if LYRION_NUM_MODULES >= 2
-      /* TX/RX loopback: radio1 → radio2 */
-      if (cc1101_ok1 && cc1101_ok2) {
-          const uint8_t test_pkt[] = "CC1101!";
-          CC1101_SetRx(&radio2);
-          CC1101_FlushTx(&radio1);
-          uint8_t sent = CC1101_SendPacket(&radio1, test_pkt, sizeof(test_pkt));
-
-          if (sent) {
-              uint32_t deadline = HAL_GetTick() + 50;
-              uint8_t rxbuf[32];
-              uint8_t rlen = 0;
-              do {
-                  rlen = CC1101_ReceivePacket(&radio2, rxbuf, sizeof(rxbuf), 0);
-                  if (rlen > 0) break;
-              } while (HAL_GetTick() < deadline);
-
-              if (rlen == sizeof(test_pkt)) {
-                  uint8_t match = 1;
-                  for (uint8_t i = 0; i < rlen; i++)
-                      if (rxbuf[i] != test_pkt[i]) { match = 0; break; }
-                  cc1101_loopback = match ? 1 : 2;
-              } else {
-                  cc1101_loopback = 2;
-              }
-          } else {
-              cc1101_loopback = 2;
-          }
-
+      uint8_t radios_ok = 0;
+  #if CC1101_ENABLE_RADIO1
+      cc1101_config_t cfg1 = {
+          .spi = &hspi1,
+          .cs_port = CS1_GPIO_Port,   .cs_pin   = CS1_Pin,
+          .miso_port = CC1101_MISO_PORT, .miso_pin = CC1101_MISO_PIN,
+          .gdo0_port = GDO0_1_GPIO_Port, .gdo0_pin = GDO0_1_Pin,
+          .gdo2_port = GDO2_1_GPIO_Port, .gdo2_pin = GDO2_1_Pin,
+      };
+      cc1101_status_t st1 = cc1101_init(&radio1, &cfg1, CC1101_MOD_ASK_OOK,
+                                         433.5f, 4.0f);
+      if (st1 != CC1101_STATUS_OK) {
           #if ENABLE_UART1 && UART_DEBUG
-          char dbg[] = "LPBK: OK\r\n";
-          if (cc1101_loopback == 2) { dbg[5] = 'F'; dbg[6] = 'A'; dbg[7] = 'I'; dbg[8] = 'L'; dbg[9] = '\r'; dbg[10] = '\n'; dbg[11] = 0; }
-          HAL_UART_Transmit(&huart1, (uint8_t*)dbg, cc1101_loopback == 1 ? 10 : 12, 100);
+          HAL_UART_Transmit(&huart1, (uint8_t *)"R1: FAIL\r\n", 9, 100);
+          #endif
+      } else {
+          radios_ok++;
+          cc1101_radio1 = &radio1;
+          #if ENABLE_UART1 && UART_DEBUG
+          HAL_UART_Transmit(&huart1, (uint8_t *)"R1: OK\r\n", 8, 100);
           #endif
       }
-      #endif
+  #endif
+  #if CC1101_ENABLE_RADIO2
+      cc1101_config_t cfg2 = {
+          .spi = &hspi1,
+          .cs_port = CS2_GPIO_Port,   .cs_pin   = CS2_Pin,
+          .miso_port = CC1101_MISO_PORT, .miso_pin = CC1101_MISO_PIN,
+          .gdo0_port = GDO0_2_GPIO_Port, .gdo0_pin = GDO0_2_Pin,
+          .gdo2_port = GDO2_2_GPIO_Port, .gdo2_pin = GDO2_2_Pin,
+      };
+      cc1101_status_t st2 = cc1101_init(&radio2, &cfg2, CC1101_MOD_ASK_OOK,
+                                         433.5f, 4.0f);
+      if (st2 != CC1101_STATUS_OK) {
+          #if ENABLE_UART1 && UART_DEBUG
+          HAL_UART_Transmit(&huart1, (uint8_t *)"R2: FAIL\r\n", 9, 100);
+          #endif
+      } else {
+          radios_ok++;
+          (void)radio2;
+          #if ENABLE_UART1 && UART_DEBUG
+          HAL_UART_Transmit(&huart1, (uint8_t *)"R2: OK\r\n", 8, 100);
+          #endif
+      }
+  #endif
+      (void)radios_ok;
 
-      /* Enter RX for normal operation. */
-      if (cc1101_ok1) CC1101_SetRx(&radio1);
-      #if LYRION_NUM_MODULES >= 2
-      if (cc1101_ok2) CC1101_SetRx(&radio2);
-      #endif
+      if (cc1101_radio1) {
+          cc1101_t *r = cc1101_radio1;
 
-      /* CC1101_Init above wrote IOCFG=0x06, disabling the 26 MHz clock
-         output on GDO0/GDO2.  Now safe to unmask EXTI for packet RX. */
-      EXTI->IMR1 |= GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
+          cc1101_set_modulation(r, CC1101_MOD_ASK_OOK);
+          cc1101_set_frequency(r, 433.8f);
+          cc1101_set_data_rate(r, 1.0f);
+          cc1101_set_output_power(r, 10);
+
+          cc1101_set_packet_length_mode(r, CC1101_PKT_LEN_MODE_VARIABLE, 255);
+          cc1101_set_address_filtering_mode(r, CC1101_ADDR_FILTER_MODE_NONE);
+          cc1101_set_preamble_length(r, 64);
+          cc1101_set_sync_word(r, 0x1234);
+          cc1101_set_sync_mode(r, CC1101_SYNC_MODE_16_16);
+          cc1101_set_crc(r, true);
+          cc1101_set_data_whitening(r, true);
+          cc1101_set_manchester(r, false);
+          cc1101_set_fec(r, false);
+
+          cc1101_set_receive_action(r, on_cc1101_rx_data, CC1101_GDO0);
+          cc1101_start_receive(r, 0);
+      }
   }
   #endif
 
@@ -405,57 +433,49 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	#if ENABLE_CC1101
-	/* Interrupt-driven RX: EXTI handler set rx_ready; read FIFO here. */
-	if (radio1.sync_seen) {
-	    radio1.sync_seen = 0;
-	    cc1101_sync_cnt++;
-	}
-	#if LYRION_NUM_MODULES >= 2
-	if (radio2.sync_seen) {
-	    radio2.sync_seen = 0;
-	    cc1101_sync_cnt++;
-	}
-	#endif
-	if (radio1.rx_ready) {
-	    radio1.rx_ready = 0;
-	    uint8_t rxbuf[64];
-	    int8_t rssi;
-	    uint8_t n = CC1101_ReceivePacket(&radio1, rxbuf, sizeof(rxbuf), &rssi);
-	    if (n > 0) {
-	        #if ENABLE_UART1 && UART_DEBUG
-	        char dbg[] = "RX 0B\r\n";
-	        dbg[3] = hex_chars[(n >> 4) & 0xF];
-	        dbg[4] = hex_chars[n & 0xF];
-	        HAL_UART_Transmit(&huart1, (uint8_t*)dbg, 7, 100);
-	        #endif
-	    }
-	}
-	#if LYRION_NUM_MODULES >= 2
-	if (radio2.rx_ready) {
-	    radio2.rx_ready = 0;
-	    uint8_t rxbuf[64];
-	    int8_t rssi;
-	    CC1101_ReceivePacket(&radio2, rxbuf, sizeof(rxbuf), &rssi);
-	}
-	#endif
-	#endif
-
 	#if ENABLE_WS2812
 	WS2812_Example1();
 	#endif
 
-	/* Instant LED-state feedback (outside 1-second tick). */
-	#if ENABLE_OLED
-	if (led_event)
-	{
-	    led_event = 0;
-	    ssd1306_SetCursor(2, 32);
-	    if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
-	        ssd1306_WriteString("Led: ON", Font_6x8, White);
-	    else
-	        ssd1306_WriteString("Led: OFF", Font_6x8, White);
+	#if ENABLE_CC1101
+	if (cc1101_radio1 && cc1101_rx_ready) {
+	    cc1101_rx_ready = false;
+
+	    uint8_t rx_buf[64];
+	    size_t  rx_len = 0;
+
+	    cc1101_status_t st = cc1101_read_data(cc1101_radio1, rx_buf,
+	                                           sizeof(rx_buf), &rx_len);
+	    if (st == CC1101_STATUS_OK) {
+	        rx_buf[rx_len] = '\0';
+
+	        size_t copy_len = rx_len;
+	        if (copy_len >= sizeof(cc1101_rx_msg))
+	            copy_len = sizeof(cc1101_rx_msg) - 1;
+	        memcpy(cc1101_rx_msg, rx_buf, copy_len);
+	        cc1101_rx_msg[copy_len] = '\0';
+
+	        cc1101_rx_rssi  = cc1101_get_rssi(cc1101_radio1);
+	        cc1101_rx_lqi   = cc1101_get_lqi(cc1101_radio1);
+
+	        #if ENABLE_UART1 && UART_DEBUG
+	        HAL_UART_Transmit(&huart1, (uint8_t *)"RX OK\r\n", 7, 100);
+	        #endif
+	    } else if (st == CC1101_STATUS_CRC_MISMATCH) {
+	        memcpy(cc1101_rx_msg, "CRC ERR", 8);
+	        cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
+	        cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	        #if ENABLE_UART1 && UART_DEBUG
+	        HAL_UART_Transmit(&huart1, (uint8_t *)"CRC ERR\r\n", 9, 100);
+	        #endif
+	    }
+
+	    #if ENABLE_OLED
+	    oled_show_rx(cc1101_rx_msg, cc1101_rx_rssi, cc1101_rx_lqi);
 	    ssd1306_UpdateScreen();
+	    #endif
+
+	    cc1101_start_receive(cc1101_radio1, 0);
 	}
 	#endif
 
@@ -463,56 +483,8 @@ int main(void)
 	{
 	    lastTick = HAL_GetTick();
 
-	    #if ENABLE_UART1 && UART_DEBUG
-	    HAL_UART_Transmit(&huart1, (uint8_t *)"Hello, World!\r\n", 15, 100);
-	    #endif
-
-	    /* Live uptime counter on the OLED (blue, line 1). */
-	    #if ENABLE_OLED
-	    char buf[8];
-	    int len = uitoa(lastTick / 1000U, buf);
-	    buf[len]     = 's';
-	    buf[len + 1] = '\0';
-	    ssd1306_SetCursor(2, 16);
-	    ssd1306_WriteString("Up: ", Font_6x8, White);
-	    ssd1306_WriteString(buf, Font_6x8, White);
-	    #endif
-
 	    #if ENABLE_TMP102 && ENABLE_OLED
 	    oled_show_temp(TMP102_ReadTemp(&hi2c1));
-	    #endif
-
-	    #if ENABLE_OLED
-	    ssd1306_SetCursor(2, 32);
-	    if (HAL_GPIO_ReadPin(Blink1_GPIO_Port, Blink1_Pin))
-	        ssd1306_WriteString("Led: ON", Font_6x8, White);
-	    else
-	        ssd1306_WriteString("Led: OFF", Font_6x8, White);
-	    #endif
-
-	    #if ENABLE_CC1101 && ENABLE_OLED
-	    ssd1306_SetCursor(2, 40);
-	    ssd1306_WriteString("R1:", Font_6x8, White);
-	    ssd1306_WriteString(cc1101_ok1 ? "OK " : "FAIL", Font_6x8, White);
-	    #if LYRION_NUM_MODULES >= 2
-	    ssd1306_WriteString("R2:", Font_6x8, White);
-	    ssd1306_WriteString(cc1101_ok2 ? "OK " : "FAIL", Font_6x8, White);
-	    #endif
-
-	    ssd1306_SetCursor(2, 48);
-	    ssd1306_WriteString("REG:", Font_6x8, White);
-	    ssd1306_WriteString(cc1101_regtest ? "OK " : "FAIL", Font_6x8, White);
-	    /* Sync detections (GDO2 rising edge) */
-	    {
-	        char s[8];
-	        s[0] = ' '; s[1] = 'S'; s[2] = 'Y'; s[3] = ':';
-	        uint32_t n = cc1101_sync_cnt;
-	        s[7] = 0;
-	        s[6] = (char)('0' + n % 10); n /= 10;
-	        s[5] = (char)('0' + n % 10); n /= 10;
-	        s[4] = (char)('0' + n % 10);
-	        ssd1306_WriteString(s, Font_6x8, White);
-	    }
 	    #endif
 
 	    #if ENABLE_I2C_SCAN
@@ -787,14 +759,14 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* Dynamic SPI clock: if HSE failed (HSI fallback, 48 MHz), prescaler 2
-     would give 24 MHz SPI — the CC1101 max is 10 MHz, causing bit errors.
-     Adjust the prescaler so SPI ≤ 6 MHz regardless of system clock.
+     would give 24 MHz SPI ??? the CC1101 max is 10 MHz, causing bit errors.
+     Adjust the prescaler so SPI ??? 6 MHz regardless of system clock.
      Run this FIRST because HAL_SPI_Init below would re-call HAL_SPI_MspInit
-     which resets GPIO speed to LOW — so we fix GPIO speed AFTER. */
+     which resets GPIO speed to LOW ??? so we fix GPIO speed AFTER. */
   {
       uint32_t apb1 = HAL_RCC_GetPCLK1Freq();
       uint32_t br_val = (hspi1.Instance->CR1 & SPI_CR1_BR) >> SPI_CR1_BR_Pos;
-      uint32_t divisor = 2u << br_val;  /* 0→2, 1→4, 2→8, 3→16, … */
+      uint32_t divisor = 2u << br_val;  /* 0???2, 1???4, 2???8, 3???16, ??? */
       uint32_t spi_speed = apb1 / divisor;
       if (spi_speed > 10000000) {
           hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
@@ -1038,49 +1010,16 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GDO2_1_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* Keep CubeMX's EXTI config (IT_FALLING/IT_RISING) but add PULLDOWN
-     and mask IMR1.  The CC1101 defaults to outputting a 26 MHz clock
-     on GDO0/GDO2 after power-on — if EXTI is unmasked before IOCFG
-     is written (in CC1101_Init), the 26 MHz edges cause instant ISR
-     livelock and the system never reaches USER CODE.
-     We'll unmask IMR1 in USER CODE BEGIN 2 after CC1101_Init. */
-  GPIO_InitStruct.Pin = GDO0_2_Pin|GDO0_1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = GDO2_2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GDO2_2_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = GDO2_1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GDO2_1_GPIO_Port, &GPIO_InitStruct);
-
-  /* Mask EXTI at the peripheral level — will unmask after CC1101 init
-     has written IOCFG to disable the clock output on GDO0/GDO2. */
+  #if ENABLE_CC1101
+  /* The CC1101 outputs a 26 MHz clock on GDO0/GDO2 after power-on (before
+   * IOCFG is written by cc1101_init). Mask the EXTI lines here so the edges
+   * cannot fire ISRs and livelock the system. The CC1101 driver unmaskes a
+   * line in cc1101_port_attach_interrupt() only after the corresponding GDO
+   * signal has been configured (set_receive/transmit_action). */
   EXTI->IMR1 &= ~(GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin);
-  EXTI->RPR1  =  GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
-  EXTI->FPR1  =  GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin;
-
-  /* CS pins: drive HIGH and add PULLUP, so CS stays deasserted during
-     STM32 reset (CC1101 has no HW reset line). */
-  HAL_GPIO_WritePin(CS1_GPIO_Port, CS1_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = CS1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(CS1_GPIO_Port, &GPIO_InitStruct);
-
-  HAL_GPIO_WritePin(CS2_GPIO_Port, CS2_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = CS2_Pin;
-  HAL_GPIO_Init(CS2_GPIO_Port, &GPIO_InitStruct);
-
-  HAL_GPIO_WritePin(CS3_GPIO_Port, CS3_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = CS3_Pin;
-  HAL_GPIO_Init(CS3_GPIO_Port, &GPIO_InitStruct);
+  EXTI->RPR1  =  (GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin);
+  EXTI->FPR1  =  (GDO0_2_Pin | GDO0_1_Pin | GDO2_2_Pin | GDO2_1_Pin);
+  #endif
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -1093,22 +1032,16 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
     led_event = 1;
   }
   #if ENABLE_CC1101
-  /* GDO2 pins: "sync word detected" — set flag only (no SPI in ISR). */
-  if (radio1.spi) CC1101_HandleGdo2(&radio1, GPIO_Pin);
-  #if LYRION_NUM_MODULES >= 2
-  if (radio2.spi) CC1101_HandleGdo2(&radio2, GPIO_Pin);
-  #endif
+  /* Dispatch GDO rising edges (RX-ready) to the CC1101 callback registry. */
+  cc1101_on_rising_edge(GPIO_Pin);
   #endif
 }
 
 #if ENABLE_CC1101
 void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 {
-  /* GDO0 pins: "packet RX done" — set rx_ready, no SPI in ISR. */
-  if (radio1.spi) CC1101_HandleGdo0(&radio1, GPIO_Pin);
-  #if LYRION_NUM_MODULES >= 2
-  if (radio2.spi) CC1101_HandleGdo0(&radio2, GPIO_Pin);
-  #endif
+  /* Dispatch GDO falling edges (TX-complete) to the CC1101 callback registry. */
+  cc1101_on_falling_edge(GPIO_Pin);
 }
 #endif
 

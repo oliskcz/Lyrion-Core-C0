@@ -13,6 +13,10 @@ Release/
 
 # IDE workspace settings (not project settings)
 .settings/
+.kilo/
+
+# Visual Studio (VS Code / VS)
+.vs/
 
 # Launch files (debug configurations)
 *.launch

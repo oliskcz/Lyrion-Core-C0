@@ -1,428 +1,1085 @@
 /**
  * @file  cc1101.c
- * @brief Minimal CC1101 SPI driver (polling, no EXTI).
+ * @brief C driver for the TI CC1101 sub-1 GHz RF transceiver (protocol logic).
  *
- * SPI access is fully blocking (HAL_SPI_TransmitReceive). CHIP_RDYn handshake
- * uses a software timeout on MISO. Everything runs in thread context — no
- * interrupt handlers touch the radio.
+ * Faithful C port of the Arduino CC1101 library by Mateusz Furga. This file
+ * contains only the chip protocol logic (register access, frequency/power
+ * computation, packet TX/RX). All hardware-abstraction calls (SPI transfer,
+ * GPIO CS/MISO, microsecond delay, EXTI callback attach/detach) are delegated
+ * to the port layer in cc1101_port.c, keeping this file portable.
  *
- * Register configuration tables adapted from dsoldevila/CC1101 (GitHub).
- *
- * No libc calls.
+ * @copyright Copyright (c) 2023 Mateusz Furga (original Arduino library, MIT)
+ * @copyright SPDX-License-Identifier: MIT
  */
 
 #include "cc1101.h"
+#include "cc1101_port.h"
 
-/* ---- MISO pin used for CHIP_RDYn handshake ------------------------------- */
-/* Both radio modules on Lyrion Core C0 share SPI1 (MISO = PA6). */
-#define CC1101_MISO_PORT  GPIOA
-#define CC1101_MISO_PIN   GPIO_PIN_6
+#include <string.h>
 
-/* ---- Crystal frequency for FREQ computation ------------------------------ */
-#define CC1101_XTAL_HZ    LYRION_XTAL_HZ
+/* -------------------------------------------------------------------------- */
+/*  Internal helpers                                                          */
+/* -------------------------------------------------------------------------- */
 
-/* ---- Register config tables (from dsoldevila/CC1101, via SmartRF Studio) - */
-/* Each table is 47 bytes, one per config register (IOCFG2 … TEST0). */
-#define CC1101_NUM_CFG_REGS  47
+#define CC1101_MIN(a, b) (((a) < (b)) ? (a) : (b))
 
-static const uint8_t cc1101_cfg_gfsk_38k4[CC1101_NUM_CFG_REGS] = {
-    0x06, 0x2E, 0x06, 0x07, 0x57, 0x43, 0x3E, 0xDC, 0x45, /* 00-08 */
-    0xFF, 0x00, 0x06, 0x00, 0x21, 0x65, 0x6A, 0xCA, 0x83, /* 09-11 */
-    0x13, 0xA0, 0xF8, 0x34, 0x07, 0x0C, 0x18, 0x16, 0x6C, /* 12-1A */
-    0x43, 0x40, 0x91, 0x02, 0x26, 0x09, 0x56, 0x17, 0xA9, /* 1B-23 */
-    0x0A, 0x00, 0x11, 0x41, 0x00, 0x59, 0x7F, 0x3F, 0x81, /* 24-2C */
-    0x3F, 0x0B                                            /* 2D-2E */
-};
+/* Status registers span this address range (burst-on-read, read-only). */
+#define CC1101_STATUS_REG_LO  CC1101_REG_PARTNUM         /* 0x30 */
+#define CC1101_STATUS_REG_HI  CC1101_REG_RCCTRL0_STATUS  /* 0x3d */
 
-static const uint8_t cc1101_cfg_gfsk_1k2[CC1101_NUM_CFG_REGS] = {
-    0x07, 0x2E, 0x80, 0x07, 0x57, 0x43, 0x3E, 0xD8, 0x45,
-    0xFF, 0x00, 0x08, 0x00, 0x21, 0x65, 0x6A, 0xF5, 0x83,
-    0x13, 0xC0, 0xF8, 0x15, 0x07, 0x00, 0x18, 0x16, 0x6C,
-    0x03, 0x40, 0x91, 0x02, 0x26, 0x09, 0x56, 0x17, 0xA9,
-    0x0A, 0x00, 0x11, 0x41, 0x00, 0x59, 0x7F, 0x3F, 0x81,
-    0x3F, 0x0B
-};
-
-/* ---- PATABLE values for 433 MHz (0 = -30 dBm … 7 = +10 dBm) -------------- */
-static const uint8_t patable_433[8] = {
-    0x6C, 0x1C, 0x06, 0x3A, 0x51, 0x85, 0xC8, 0xC0
-};
-
-/* ---- Band centre frequencies (Hz) ----------------------------------------- */
-static const uint32_t band_centre[4] = {
-    315000000UL,
-    434000000UL,
-    868300000UL,
-    915000000UL
-};
-
-/* ---- Diagnostics --------------------------------------------------------- */
-volatile uint8_t cc1101_dbg_ver = 0;  /* last VERSION read by Check */
-
-/* ======================================================================== */
-/*  Private helpers                                                          */
-/* ======================================================================== */
-
-static uint8_t rx_dummy = 0;
-
-static inline void cs_low(cc1101_t *d) {
-    HAL_GPIO_WritePin(d->cs_port, d->cs_pin, GPIO_PIN_RESET);
+static inline bool is_status_reg(uint8_t addr)
+{
+    return addr >= CC1101_STATUS_REG_LO && addr <= CC1101_STATUS_REG_HI;
 }
-static inline void cs_high(cc1101_t *d) {
-    HAL_GPIO_WritePin(d->cs_port, d->cs_pin, GPIO_PIN_SET);
+
+static void set_gdo_config(cc1101_t *r, cc1101_gdo_pin_t pin, cc1101_gdo_config_t cfg)
+{
+    uint8_t reg = (pin == CC1101_GDO2) ? CC1101_REG_IOCFG2 : CC1101_REG_IOCFG0;
+    cc1101_write_reg_field(r, reg, (uint8_t)cfg, 5, 0);
+}
+
+static uint16_t gdo_to_gpio(cc1101_t *r, cc1101_gdo_pin_t pin)
+{
+    return (pin == CC1101_GDO2) ? r->gdo2_pin : r->gdo0_pin;
+}
+
+static bool is_gdo_pin_configured(cc1101_t *r, cc1101_gdo_pin_t pin)
+{
+    return gdo_to_gpio(r, pin) != CC1101_PIN_UNUSED;
+}
+
+static void chip_select(cc1101_t *r)
+{
+    cc1101_gpio_write(r->cs_port, r->cs_pin, false);
+}
+
+static void chip_deselect(cc1101_t *r)
+{
+    cc1101_gpio_write(r->cs_port, r->cs_pin, true);
+}
+
+/* Wait until MISO goes low (chip ready). On STM32 the MISO pin is configured
+ * as SPI alternate function but its input data register (IDR) is still
+ * readable, so we can poll it directly. */
+static void wait_ready(cc1101_t *r)
+{
+    while (cc1101_gpio_read(r->miso_port, r->miso_pin)) {
+        /* spin */
+    }
+}
+
+/* A single full-duplex SPI byte exchange. Returns the byte clocked in. */
+static uint8_t spi_xfer(cc1101_t *r, uint8_t tx)
+{
+    uint8_t rx = 0;
+    cc1101_spi_transfer(r->spi, &tx, &rx, 1);
+    return rx;
+}
+
+static void save_status(cc1101_t *r, uint8_t status)
+{
+    r->currentState = (cc1101_state_t)((status >> 4) & 0x07);
+}
+
+static void send_cmd(cc1101_t *r, uint8_t addr)
+{
+    uint8_t header = (uint8_t)(CC1101_WRITE | (addr & 0x3F));
+
+    chip_select(r);
+    wait_ready(r);
+    save_status(r, spi_xfer(r, header));
+    chip_deselect(r);
+}
+
+static void hard_reset(cc1101_t *r)
+{
+    /* Manual power-up reset sequence per datasheet (Section 11.1). */
+    chip_deselect(r);
+    cc1101_delay_us(5);
+    chip_select(r);
+    cc1101_delay_us(5);
+    chip_deselect(r);
+    cc1101_delay_us(40);
+
+    chip_select(r);
+    wait_ready(r);
+    save_status(r, spi_xfer(r, CC1101_CMD_RES));
+    wait_ready(r);
+    chip_deselect(r);
+}
+
+static void flush_rx_buffer(cc1101_t *r)
+{
+    if (r->currentState != CC1101_STATE_IDLE &&
+        r->currentState != CC1101_STATE_RXFIFO_OVERFLOW) {
+        return;
+    }
+    send_cmd(r, CC1101_CMD_FRX);
+}
+
+static void flush_tx_buffer(cc1101_t *r)
+{
+    if (r->currentState != CC1101_STATE_IDLE &&
+        r->currentState != CC1101_STATE_TXFIFO_UNDERFLOW) {
+        return;
+    }
+    send_cmd(r, CC1101_CMD_FTX);
+}
+
+static cc1101_state_t get_state(cc1101_t *r)
+{
+    send_cmd(r, CC1101_CMD_NOP);
+    return r->currentState;
+}
+
+static void set_state(cc1101_t *r, cc1101_state_t state)
+{
+    switch (state) {
+    case CC1101_STATE_IDLE:
+        send_cmd(r, CC1101_CMD_IDLE);
+        break;
+    case CC1101_STATE_TX:
+        send_cmd(r, CC1101_CMD_TX);
+        break;
+    case CC1101_STATE_RX:
+        send_cmd(r, CC1101_CMD_RX);
+        break;
+    default:
+        return;   /* not supported */
+    }
+    while (get_state(r) != state) {
+        cc1101_delay_us(100);
+    }
+}
+
+static void set_regs(cc1101_t *r)
+{
+    /* Automatically calibrate when going from IDLE to RX or TX. */
+    cc1101_write_reg_field(r, CC1101_REG_MCSM0, 1, 5, 4);
+
+    /* Return to IDLE after a packet is received (MCSM1.RXOFF_MODE = IDLE) */
+    cc1101_write_reg_field(r, CC1101_REG_MCSM1, 0, 3, 2);
+
+    /* Append the 2 status bytes (RSSI + LQI/CRC_OK) to every packet and never
+     * auto-flush the RX FIFO on CRC error; both are assumptions receive()
+     * relies on. */
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL1, 1, 2, 2);  /* APPEND_STATUS */
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL1, 0, 3, 3);  /* CRC_AUTOFLUSH */
+
+    /* RX FIFO threshold = 40 bytes (TX FIFO threshold = 25 bytes) */
+    cc1101_write_reg_field(r, CC1101_REG_FIFOTHR, 0x09, 3, 0);
+
+    /* Disable data whitening. */
+    cc1101_set_data_whitening(r, false);
 }
 
 /*
- * Wait for MISO==1 (CHIP_RDYn). The GPIO IDR reflects pin level even in AF
- * mode, so a read of PA6 works.  Reference library (suleymaneskil/CC1101)
- * uses an unconditional spin — we add a 100 ms safety timeout to avoid
- * hanging on a dead chip.  The CC1101 typically releases CHIP_RDYn within
- * 150 us; after a warm reset it can take up to 1-2 ms.
+ * Read the NUM_*BYTES field of a FIFO byte-count status register repeatedly
+ * until the same value is returned twice, per datasheet errata (SWRZ020E).
  */
-uint8_t CC1101_WaitMiso(cc1101_t *d)
+static uint8_t read_fifo_byte_count(cc1101_t *r, uint8_t addr)
 {
-    (void)d;
-    uint32_t deadline = HAL_GetTick() + 100;  /* 100 ms absolute cap */
-    while (HAL_GPIO_ReadPin(CC1101_MISO_PORT, CC1101_MISO_PIN) == GPIO_PIN_RESET) {
-        if (HAL_GetTick() > deadline) return 0;
+    uint8_t a = cc1101_read_reg_field(r, addr, 6, 0);
+    uint8_t b;
+    for (uint8_t i = 0; i < CC1101_FIFO_BYTES_MAX_READS; i++) {
+        b = a;
+        a = cc1101_read_reg_field(r, addr, 6, 0);
+        if (a == b) {
+            break;
+        }
     }
-    return 1;
-}
-
-/* ======================================================================== */
-/*  SPI access                                                               */
-/* ======================================================================== */
-
-void CC1101_WriteStrobe(cc1101_t *d, uint8_t strobe)
-{
-    uint8_t rx;
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &strobe, &rx, 1, 100);
-    cs_high(d);
-}
-
-void CC1101_WriteReg(cc1101_t *d, uint8_t addr, uint8_t value)
-{
-    uint8_t tx[2] = { (uint8_t)(addr | CC1101_WRITE), value };
-    uint8_t rx[2];
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, tx, rx, 2, 100);
-    cs_high(d);
-}
-
-uint8_t CC1101_ReadReg(cc1101_t *d, uint8_t addr)
-{
-    uint8_t hdr = (uint8_t)(addr | CC1101_READ | CC1101_BURST);
-    uint8_t val = 0;
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &hdr, &rx_dummy, 1, 100);
-    HAL_SPI_TransmitReceive(d->spi, &rx_dummy, &val, 1, 100);
-    cs_high(d);
-    return val;
-}
-
-void CC1101_WriteBurst(cc1101_t *d, uint8_t addr, const uint8_t *data, uint8_t n)
-{
-    uint8_t hdr = (uint8_t)(addr | CC1101_WRITE | CC1101_BURST);
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &hdr, &rx_dummy, 1, 100);
-    for (uint8_t i = 0; i < n; i++)
-        HAL_SPI_TransmitReceive(d->spi, (uint8_t *)&data[i], &rx_dummy, 1, 100);
-    cs_high(d);
-}
-
-void CC1101_ReadBurst(cc1101_t *d, uint8_t addr, uint8_t *data, uint8_t n)
-{
-    uint8_t hdr = (uint8_t)(addr | CC1101_READ | CC1101_BURST);
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &hdr, &rx_dummy, 1, 100);
-    for (uint8_t i = 0; i < n; i++)
-        HAL_SPI_TransmitReceive(d->spi, &rx_dummy, &data[i], 1, 100);
-    cs_high(d);
-}
-
-/* ======================================================================== */
-/*  Public API                                                               */
-/* ======================================================================== */
-
-/*
- * CC1101 power-on / reset sequence.
- *
- * Because there is no hardware reset line, after an STM32 warm reset the
- * CC1101 may be in a locked SPI state (interrupted transaction, sleep, etc).
- * The recovery is:
- *   1. Pulse CS low → high with a finite wait (clears stuck SPI FSM)
- *   2. Send SRES multiple times (each strobe re-initialises the digital core)
- *   3. Wait for the chip to stabilise before any register access
- */
-void CC1101_Reset(cc1101_t *d)
-{
-    /* Start with CS deasserted. */
-    cs_high(d);
-
-    /* Pulse CS low → high to clear any stuck SPI transaction.
-       Minimum low time ~20 us, high time ~40 us per datasheet. */
-    cs_low(d);
-    {
-        volatile uint32_t t = 160;  /* ~20 us @ 8 MHz */
-        while (--t) __NOP();
-    }
-    cs_high(d);
-    {
-        volatile uint32_t t = 320;  /* ~40 us @ 8 MHz */
-        while (--t) __NOP();
-    }
-
-    /* Send SRES repeatedly.  The first may be ignored if the SPI FSM is
-       wedged; the second or third usually reset the chip. */
-    for (uint8_t i = 0; i < 3; i++) {
-        CC1101_WriteStrobe(d, CC1101_SRES);
-        /* SRES takes ~150 us internally; wait 1 ms between retries. */
-        volatile uint32_t t = 8000;  /* ~1 ms @ 8 MHz */
-        while (--t) __NOP();
-    }
-
-    /* Allow the digital core to stabilise after SRES. */
-    volatile uint32_t t = 8000;
-    while (--t) __NOP();
+    return a;
 }
 
 /*
- * Initialise: reset, verify SPI, then load config.
- *
- * Order matches dsoldevila/CC1101 reference: reset → check VERSION →
- * only then write config registers.  This avoids corrupting the CC1101
- * with 47 garbage burst-write bytes if SPI is not yet reliable.
+ * Reliable RX FIFO overflow check. RXBYTES.RXFIFO_OVERFLOW is a single-bit
+ * field, which the SPI read-synchronization errata lists as immune to
+ * corruption (unlike the status-byte STATE field).
  */
-uint8_t CC1101_Init(cc1101_t *d, cc1101_band_t band, cc1101_mod_t mod)
+static bool rx_fifo_overflowed(cc1101_t *r)
 {
-    if (!d || !d->spi) return 0;
-
-    for (uint8_t attempt = 0; attempt < 3; attempt++) {
-        /* Between retries, pulse CS to clear a stuck SPI state machine. */
-        if (attempt > 0) {
-            cs_low(d);
-            { volatile uint32_t t = 160; while (--t) __NOP(); }
-            cs_high(d);
-            { volatile uint32_t t = 320; while (--t) __NOP(); }
-        } else {
-            cs_high(d);
-        }
-
-        CC1101_Reset(d);
-
-        /* Verify SPI BEFORE any config writes — matches reference rf_begin(). */
-        if (!CC1101_Check(d)) {
-            HAL_Delay(5);
-            continue;   /* try reset again */
-        }
-
-        /* SPI is confirmed working — now safe to write config. */
-        CC1101_WriteStrobe(d, CC1101_SFRX);
-        CC1101_WriteStrobe(d, CC1101_SFTX);
-
-        const uint8_t *cfg;
-        switch (mod) {
-            case CC1101_MOD_GFSK_1_2KB:  cfg = cc1101_cfg_gfsk_1k2;  break;
-            default:
-            case CC1101_MOD_GFSK_38_4KB: cfg = cc1101_cfg_gfsk_38k4; break;
-            case CC1101_MOD_GFSK_100KB:
-            case CC1101_MOD_MSK_250KB:
-            case CC1101_MOD_MSK_500KB:
-            case CC1101_MOD_OOK_4_8KB:   cfg = cc1101_cfg_gfsk_38k4; break;
-        }
-
-        CC1101_WriteBurst(d, 0x00, cfg, CC1101_NUM_CFG_REGS);
-
-        {
-            uint32_t hz = band_centre[(band < CC1101_BAND_915) ? band : CC1101_BAND_868];
-            CC1101_SetFrequency(d, hz);
-        }
-
-        CC1101_SetTxPower(d, -10);
-
-        return 1;   /* Check already passed above */
-    }
-
-    return 0;
+    return cc1101_read_reg_field(r, CC1101_REG_RXBYTES, 7, 7) != 0;
 }
 
-/*
- * Read VERSION register; expected value is 0x14.
- * Stores the last read value in cc1101_dbg_ver for diagnostics.
- * Returns 1 if version matches, 0 otherwise.
- */
-uint8_t CC1101_Check(cc1101_t *d)
+static bool tx_fifo_underflowed(cc1101_t *r)
 {
-    cc1101_dbg_ver = 0;
-    for (uint8_t i = 0; i < 3; i++) {
-        cc1101_dbg_ver = CC1101_ReadReg(d, CC1101_VERSION);
-        if (cc1101_dbg_ver == 0x14) return 1;
-    }
-    return 0;
+    return cc1101_read_reg_field(r, CC1101_REG_TXBYTES, 7, 7) != 0;
 }
 
-/* ---- RF configuration ----------------------------------------------------- */
-
-void CC1101_SetFrequency(cc1101_t *d, uint32_t hz)
+static uint8_t wait_for_bytes_in_fifo(cc1101_t *r, uint8_t min_bytes)
 {
-    /* Clamp to valid range. */
-    if (hz < 300000000UL) hz = 300000000UL;
-    if (hz > 1000000000UL) hz = 1000000000UL;
-
-    /* FREQ = hz * 2^16 / F_xtal */
-    uint64_t freq_word = ((uint64_t)hz << 16) / CC1101_XTAL_HZ;
-    uint32_t fw = (uint32_t)freq_word;
-
-    CC1101_WriteReg(d, CC1101_FREQ2, (uint8_t)(fw >> 16));
-    CC1101_WriteReg(d, CC1101_FREQ1, (uint8_t)(fw >> 8));
-    CC1101_WriteReg(d, CC1101_FREQ0, (uint8_t)(fw & 0xFF));
-}
-
-void CC1101_SetChannel(cc1101_t *d, uint8_t ch)
-{
-    CC1101_WriteReg(d, CC1101_CHANNR, ch);
-}
-
-void CC1101_SetTxPower(cc1101_t *d, int8_t dbm)
-{
-    uint8_t idx;
-    if      (dbm >= 10) idx = 7;
-    else if (dbm >= 5)  idx = 6;
-    else if (dbm >= 0)  idx = 5;
-    else if (dbm >= -5) idx = 4;
-    else if (dbm >= -10) idx = 3;
-    else if (dbm >= -15) idx = 2;
-    else if (dbm >= -20) idx = 1;
-    else                 idx = 0;
-
-    /* Write PATABLE entry (burst write to CC1101_PATABLE). */
-    uint8_t pa = patable_433[idx];
-    uint8_t hdr = CC1101_PATABLE | CC1101_WRITE | CC1101_BURST;
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &hdr, &rx_dummy, 1, 100);
-    HAL_SPI_TransmitReceive(d->spi, &pa, &rx_dummy, 1, 100);
-    cs_high(d);
-
-    /* FREND0 lower nibble selects PATABLE index. Keep at 0. */
-    CC1101_WriteReg(d, CC1101_FREND0, 0x10);
-}
-
-/* ---- State strobes ------------------------------------------------------- */
-
-void CC1101_SetRx(cc1101_t *d)
-{
-    CC1101_WriteStrobe(d, CC1101_SRX);
-}
-
-void CC1101_SetIdle(cc1101_t *d)
-{
-    CC1101_WriteStrobe(d, CC1101_SIDLE);
-}
-
-void CC1101_SetSleep(cc1101_t *d)
-{
-    CC1101_WriteStrobe(d, CC1101_SPWD);
-}
-
-void CC1101_FlushRx(cc1101_t *d)
-{
-    CC1101_WriteStrobe(d, CC1101_SIDLE);
-    CC1101_WriteStrobe(d, CC1101_SFRX);
-}
-
-void CC1101_FlushTx(cc1101_t *d)
-{
-    CC1101_WriteStrobe(d, CC1101_SIDLE);
-    CC1101_WriteStrobe(d, CC1101_SFTX);
-}
-
-/* ---- Packet I/O ----------------------------------------------------------- */
-
-uint8_t CC1101_SendPacket(cc1101_t *d, const uint8_t *data, uint8_t len)
-{
-    if (!d || !data || len == 0 || len > 61) return 0;
-
-    CC1101_FlushTx(d);
-
-    /* Write len byte + payload to TX FIFO (burst). */
-    uint8_t hdr = (uint8_t)(CC1101_TXFIFO | CC1101_WRITE | CC1101_BURST);
-    cs_low(d);
-    CC1101_WaitMiso(d);
-    HAL_SPI_TransmitReceive(d->spi, &hdr, &rx_dummy, 1, 100);
-    HAL_SPI_TransmitReceive(d->spi, &len, &rx_dummy, 1, 100);
-    for (uint8_t i = 0; i < len; i++)
-        HAL_SPI_TransmitReceive(d->spi, (uint8_t *)&data[i], &rx_dummy, 1, 100);
-    cs_high(d);
-
-    /* Strobe STX and poll for TX completion. */
-    CC1101_WriteStrobe(d, CC1101_STX);
-
-    uint32_t deadline = HAL_GetTick() + 100;  /* 100 ms cap */
-    uint8_t state;
-    do {
-        state = CC1101_ReadReg(d, CC1101_MARCSTATE) & 0x1F;
-        if (HAL_GetTick() > deadline) {
-            CC1101_WriteStrobe(d, CC1101_SIDLE);
-            CC1101_FlushTx(d);
+    uint32_t start = cc1101_millis();
+    while (true) {
+        if (rx_fifo_overflowed(r)) {
             return 0;
         }
-    } while (state != CC1101_STATE_IDLE);
-
-    return 1;
+        uint8_t bytes_in_fifo = read_fifo_byte_count(r, CC1101_REG_RXBYTES);
+        if (bytes_in_fifo >= min_bytes) {
+            return bytes_in_fifo;
+        }
+        if (cc1101_millis() - start > CC1101_RECV_TIMEOUT_MS) {
+            return 0;
+        }
+        cc1101_delay_us(15);
+    }
 }
 
-uint8_t CC1101_ReceivePacket(cc1101_t *d, uint8_t *buf, uint8_t max_len, int8_t *rssi)
+static uint8_t wait_for_space_in_fifo(cc1101_t *r, uint8_t min_space)
 {
-    if (!d || !buf || max_len == 0) return 0;
+    uint32_t start = cc1101_millis();
+    while (true) {
+        if (tx_fifo_underflowed(r)) {
+            return 0;
+        }
+        uint8_t bytes_in_fifo = read_fifo_byte_count(r, CC1101_REG_TXBYTES);
+        uint8_t space_in_fifo =
+            (bytes_in_fifo >= CC1101_FIFO_SIZE) ? 0
+                                                : (CC1101_FIFO_SIZE - bytes_in_fifo);
+        if (space_in_fifo >= min_space) {
+            return space_in_fifo;
+        }
+        if (cc1101_millis() - start > CC1101_XMIT_TIMEOUT_MS) {
+            return 0;
+        }
+        cc1101_delay_us(15);
+    }
+}
 
-    uint8_t rxbytes = CC1101_ReadReg(d, CC1101_RXBYTES) & 0x7F;
-    if (rxbytes == 0) return 0;
+static cc1101_status_t abort_receive(cc1101_t *r)
+{
+    bool overflow = rx_fifo_overflowed(r);
+    set_state(r, CC1101_STATE_IDLE);
+    flush_rx_buffer(r);
+    return overflow ? CC1101_STATUS_RXFIFO_OVERFLOW : CC1101_STATUS_TIMEOUT;
+}
 
-    /* Read length byte from RX FIFO. */
-    uint8_t pktlen;
-    CC1101_ReadBurst(d, CC1101_RXFIFO, &pktlen, 1);
+static cc1101_status_t abort_transmit(cc1101_t *r)
+{
+    bool underflow = tx_fifo_underflowed(r);
+    set_state(r, CC1101_STATE_IDLE);
+    flush_tx_buffer(r);
+    return underflow ? CC1101_STATUS_TXFIFO_UNDERFLOW : CC1101_STATUS_TIMEOUT;
+}
 
-    if (pktlen == 0 || pktlen > max_len) {
-        CC1101_FlushRx(d);
-        CC1101_SetRx(d);
-        return 0;
+/* -------------------------------------------------------------------------- */
+/*  Public API                                                                 */
+/* -------------------------------------------------------------------------- */
+
+cc1101_status_t cc1101_init(cc1101_t *r, const cc1101_config_t *cfg,
+                             cc1101_modulation_t mod, float freq, float drate)
+{
+    cc1101_status_t status;
+
+    /* Copy hardware binding. */
+    r->spi       = cfg->spi;
+    r->cs_port   = cfg->cs_port;   r->cs_pin   = cfg->cs_pin;
+    r->miso_port = cfg->miso_port; r->miso_pin = cfg->miso_pin;
+    r->gdo0_port = cfg->gdo0_port; r->gdo0_pin = cfg->gdo0_pin;
+    r->gdo2_port = cfg->gdo2_port; r->gdo2_pin = cfg->gdo2_pin;
+
+    /* Reset internal state to defaults. */
+    r->currentState    = CC1101_STATE_IDLE;
+    r->mod             = CC1101_MOD_2FSK;
+    r->pktLenMode      = CC1101_PKT_LEN_MODE_FIXED;
+    r->addrFilterMode  = CC1101_ADDR_FILTER_MODE_NONE;
+    r->freq            = 433.5f;
+    r->drate           = 4.0f;
+    r->power           = 0;
+    r->pktLen          = 0;
+    r->rssi            = 0;
+    r->lqi             = 0;
+    r->manchester      = false;
+    r->fec             = false;
+    r->transmitActionPin = CC1101_GDO0;
+    r->receiveActionPin  = CC1101_GDO0;
+    r->tx_action_gpio  = CC1101_PIN_UNUSED;
+    r->rx_action_gpio  = CC1101_PIN_UNUSED;
+    r->tx_action       = NULL;
+    r->rx_action       = NULL;
+
+    /* Register with the EXTI dispatcher. */
+    cc1101_port_register(r);
+
+    chip_deselect(r);
+
+    hard_reset(r);
+    cc1101_delay_ms(10);
+
+    uint8_t partnum = cc1101_get_chip_part_number(r);
+    uint8_t version = cc1101_get_chip_version(r);
+    if (partnum != CC1101_PARTNUM ||
+        (version != CC1101_VERSION && version != CC1101_VERSION_LEGACY)) {
+        return CC1101_STATUS_CHIP_NOT_FOUND;
     }
 
-    /* Read payload bytes from RX FIFO. */
-    CC1101_ReadBurst(d, CC1101_RXFIFO, buf, pktlen);
+    set_regs(r);
+    cc1101_set_modulation(r, mod);
 
-    /* The CC1101 may append RSSI and LQI bytes after the payload if
-       PKTCTRL1.APPEND_STATUS is set.  We ignore those and read RSSI
-       from the status register instead. */
-    if (rssi) {
-        uint8_t r = CC1101_ReadReg(d, CC1101_RSSI);
-        int16_t dbm = (int16_t)r;
-        if (dbm >= 128) dbm -= 256;
-        *rssi = (int8_t)(dbm / 2 - 74);
+    if ((status = cc1101_set_frequency(r, freq)) != CC1101_STATUS_OK) {
+        return status;
+    }
+    if ((status = cc1101_set_data_rate(r, drate)) != CC1101_STATUS_OK) {
+        return status;
     }
 
-    CC1101_FlushRx(d);
-    CC1101_SetRx(d);
-    return pktlen;
+    cc1101_set_output_power(r, 0);
+    set_state(r, CC1101_STATE_IDLE);
+    flush_rx_buffer(r);
+    flush_tx_buffer(r);
+
+    return CC1101_STATUS_OK;
 }
 
-/* ---- EXTI dispatch helpers ----------------------------------------------- */
-
-void CC1101_HandleGdo0(cc1101_t *d, uint16_t pin)
+void cc1101_set_modulation(cc1101_t *r, cc1101_modulation_t mod)
 {
-    if (d && d->gdo0_pin == pin)
-        d->rx_ready = 1;
+    r->mod = mod;
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG2, (uint8_t)mod, 6, 4);
+
+    if (mod == CC1101_MOD_ASK_OOK) {
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL2, 0x07); /* MAGN_TARGET */
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL1, 0x00); /* AGC_LNA_PRIORITY=0 */
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL0, 0x91); /* 8 dB ASK boundary */
+    } else {
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL2, 0x03); /* reset defaults */
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL1, 0x40);
+        cc1101_write_reg(r, CC1101_REG_AGCCTRL0, 0x91);
+    }
+
+    cc1101_set_output_power(r, r->power);
+
+    if (mod == CC1101_MOD_MSK || mod == CC1101_MOD_4FSK) {
+        cc1101_set_manchester(r, false);
+    }
 }
 
-void CC1101_HandleGdo2(cc1101_t *d, uint16_t pin)
+cc1101_status_t cc1101_set_frequency(cc1101_t *r, float freq)
 {
-    if (d && d->gdo2_pin == pin)
-        d->sync_seen = 1;
+    if (!((freq >= 300.0f && freq <= 348.0f) ||
+          (freq >= 387.0f && freq <= 464.0f) ||
+          (freq >= 779.0f && freq <= 928.0f))) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+
+    r->freq = freq;
+    set_state(r, CC1101_STATE_IDLE);
+
+    uint32_t f = (uint32_t)((freq * 65536.0f) / (float)CC1101_CRYSTAL_FREQ);
+    cc1101_write_reg(r, CC1101_REG_FREQ0, (uint8_t)(f & 0xff));
+    cc1101_write_reg(r, CC1101_REG_FREQ1, (uint8_t)((f >> 8) & 0xff));
+    cc1101_write_reg(r, CC1101_REG_FREQ2, (uint8_t)((f >> 16) & 0xff));
+
+    cc1101_set_output_power(r, r->power);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_frequency_deviation(cc1101_t *r, float dev)
+{
+    float xosc = (float)(CC1101_CRYSTAL_FREQ * 1000);
+
+    float dev_min = (xosc / (float)(1UL << 17)) * (8 + 0) * 1.0f;
+    float dev_max = (xosc / (float)(1UL << 17)) * (8 + 7) * (float)(1UL << 7);
+
+    if (dev < dev_min || dev > dev_max) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+
+    uint8_t best_e = 0, best_m = 0;
+    float diff = dev_max;
+
+    for (uint8_t e = 0; e <= 7; e++) {
+        for (uint8_t m = 0; m <= 7; m++) {
+            float t = (xosc / (float)(1UL << 17)) * (float)(8 + m) * (float)(1UL << e);
+            float d = dev - t;
+            if (d < 0.0f) d = -d;
+            if (d < diff) {
+                diff = d;
+                best_e = e;
+                best_m = m;
+            }
+        }
+    }
+
+    cc1101_write_reg_field(r, CC1101_REG_DEVIATN, best_m, 2, 0);
+    cc1101_write_reg_field(r, CC1101_REG_DEVIATN, best_e, 6, 4);
+    return CC1101_STATUS_OK;
+}
+
+void cc1101_set_channel(cc1101_t *r, uint8_t ch)
+{
+    cc1101_write_reg(r, CC1101_REG_CHANNR, ch);
+}
+
+cc1101_status_t cc1101_set_channel_spacing(cc1101_t *r, float sp)
+{
+    float xosc = (float)(CC1101_CRYSTAL_FREQ * 1000);
+
+    float sp_min = (xosc / (float)(1UL << 18)) * (256.0f + 0.0f) * 1.0f;
+    float sp_max = (xosc / (float)(1UL << 18)) * (256.0f + 255.0f) * 8.0f;
+
+    if (sp < sp_min || sp > sp_max) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+
+    uint8_t best_e = 0, best_m = 0;
+    float diff = sp_max;
+
+    for (uint8_t e = 0; e <= 3; e++) {
+        for (uint16_t m = 0; m <= 255; m++) {
+            float t = (xosc / (float)(1UL << 18)) * (256.0f + (float)m) * (float)(1UL << e);
+            float d = sp - t;
+            if (d < 0.0f) d = -d;
+            if (d < diff) {
+                diff = d;
+                best_e = e;
+                best_m = (uint8_t)m;
+            }
+        }
+    }
+
+    cc1101_write_reg(r, CC1101_REG_MDMCFG0, best_m);
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG1, best_e, 1, 0);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_data_rate(cc1101_t *r, float drate)
+{
+    /* Allowed data-rate ranges per modulation (kBaud). */
+    static const float range[8][2] = {
+        [CC1101_MOD_2FSK]    = {  0.6f, 500.0f },
+        [CC1101_MOD_GFSK]    = {  0.6f, 250.0f },
+        [2]                  = {  0.0f,   0.0f },   /* gap */
+        [CC1101_MOD_ASK_OOK] = {  0.6f, 250.0f },
+        [CC1101_MOD_4FSK]    = {  0.6f, 300.0f },
+        [5]                  = {  0.0f,   0.0f },   /* gap */
+        [6]                  = {  0.0f,   0.0f },   /* gap */
+        [CC1101_MOD_MSK]     = { 26.0f, 500.0f },
+    };
+
+    if (drate < range[r->mod][0] || drate > range[r->mod][1]) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+
+    r->drate = drate;
+
+    /* Compute e (exponent) via integer floor(log2) — no math lib needed.
+     *
+     *   target = drate * 2^20 / xosc   (xosc = XTAL in kHz)
+     *   e = floor(log2(target))
+     */
+    float xosc = (float)(CC1101_CRYSTAL_FREQ * 1000);
+    float target_f = (drate * 1048576.0f) / xosc;
+    uint32_t t = (uint32_t)target_f;
+    uint8_t e = 0;
+    while (t > 1) { t >>= 1; e++; }
+
+    /* Compute m (mantissa) with round = plus 0.5, then truncate. */
+    float m_f = drate * ((float)(1UL << (28 - e)) / xosc) - 256.0f;
+    uint32_t m = (uint32_t)(m_f + 0.5f);
+
+    if (m == 256) {
+        m = 0;
+        e++;
+    }
+
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG4, e, 3, 0);
+    cc1101_write_reg(r, CC1101_REG_MDMCFG3, (uint8_t)m);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_rx_bandwidth(cc1101_t *r, float bw)
+{
+    /*
+     * CC1101 channel filter bandwidths [kHz] (26 MHz crystal):
+     *   \ E  0     1     2     3
+     *   M +----------------------
+     *   0 | 812 | 406 | 203 | 102
+     *   1 | 650 | 335 | 162 |  81
+     *   2 | 541 | 270 | 135 |  68
+     *   3 | 464 | 232 | 116 |  58
+     */
+    float bw_min = (float)(CC1101_CRYSTAL_FREQ * 1000) / (8.0f * (4 + 3) * (1 << 3));
+    float bw_max = (float)(CC1101_CRYSTAL_FREQ * 1000) / (8.0f * (4 + 0) * (1 << 0));
+
+    if (bw < bw_min || bw > bw_max) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+
+    uint8_t best_e = 0, best_m = 0;
+    float diff = bw_max;
+
+    for (uint8_t e = 0; e <= 3; e++) {
+        for (uint8_t m = 0; m <= 3; m++) {
+            float t = (float)(CC1101_CRYSTAL_FREQ * 1000) / (8.0f * (4 + m) * (float)(1 << e));
+            float d = bw - t;
+            if (d < 0.0f) d = -d;
+            if (d < diff) {
+                diff = d;
+                best_e = e;
+                best_m = m;
+            }
+        }
+    }
+
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG4, best_e, 7, 6);
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG4, best_m, 5, 4);
+    return CC1101_STATUS_OK;
+}
+
+void cc1101_set_output_power(cc1101_t *r, int8_t power)
+{
+    /* PATABLE entries per frequency band and power index (from datasheet). */
+    static const uint8_t powers[4][8] = {
+        [0] = { 0x12, 0x0d, 0x1c, 0x34, 0x51, 0x85, 0xcb, 0xc2 }, /* 315 MHz */
+        [1] = { 0x12, 0x0e, 0x1d, 0x34, 0x60, 0x84, 0xc8, 0xc0 }, /* 433 MHz */
+        [2] = { 0x03, 0x0f, 0x1e, 0x27, 0x50, 0x81, 0xcb, 0xc2 }, /* 868 MHz */
+        [3] = { 0x03, 0x0e, 0x1e, 0x27, 0x8e, 0xcd, 0xc7, 0xc0 }, /* 915 MHz */
+    };
+
+    uint8_t power_idx, freq_idx;
+
+    if (r->freq <= 348.0f) {
+        freq_idx = 0;
+    } else if (r->freq <= 464.0f) {
+        freq_idx = 1;
+    } else if (r->freq <= 891.5f) {
+        freq_idx = 2;
+    } else {
+        freq_idx = 3;
+    }
+
+    if (power <= -30)       power_idx = 0;
+    else if (power <= -20)  power_idx = 1;
+    else if (power <= -15)  power_idx = 2;
+    else if (power <= -10)  power_idx = 3;
+    else if (power <= 0)    power_idx = 4;
+    else if (power <= 5)    power_idx = 5;
+    else if (power <= 7)    power_idx = 6;
+    else                    power_idx = 7;
+
+    r->power = power;
+
+    if (r->mod == CC1101_MOD_ASK_OOK) {
+        /* No shaping: use only the first 2 PATABLE entries. */
+        uint8_t data[2] = { 0x00, powers[freq_idx][power_idx] };
+        cc1101_write_reg_burst(r, CC1101_REG_PATABLE, data, 2);
+        cc1101_write_reg_field(r, CC1101_REG_FREND0, 1, 2, 0); /* PA_POWER = 1 */
+    } else {
+        cc1101_write_reg(r, CC1101_REG_PATABLE, powers[freq_idx][power_idx]);
+        cc1101_write_reg_field(r, CC1101_REG_FREND0, 0, 2, 0); /* PA_POWER = 0 */
+    }
+}
+
+cc1101_status_t cc1101_set_preamble_length(cc1101_t *r, uint8_t length)
+{
+    uint8_t data;
+    switch (length) {
+    case 16:  data = 0; break;
+    case 24:  data = 1; break;
+    case 32:  data = 2; break;
+    case 48:  data = 3; break;
+    case 64:  data = 4; break;
+    case 96:  data = 5; break;
+    case 128: data = 6; break;
+    case 192: data = 7; break;
+    default:  return CC1101_STATUS_INVALID_PARAM;
+    }
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG1, data, 6, 4);
+    return CC1101_STATUS_OK;
+}
+
+void cc1101_set_sync_word(cc1101_t *r, uint16_t sync)
+{
+    cc1101_write_reg(r, CC1101_REG_SYNC1, (uint8_t)(sync >> 8));
+    cc1101_write_reg(r, CC1101_REG_SYNC0, (uint8_t)(sync & 0xff));
+}
+
+void cc1101_set_sync_mode(cc1101_t *r, cc1101_sync_mode_t mode)
+{
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG2, (uint8_t)mode, 2, 0);
+}
+
+void cc1101_set_packet_length_mode(cc1101_t *r, cc1101_pkt_len_mode_t mode,
+                                    uint8_t length)
+{
+    r->pktLenMode = mode;
+    r->pktLen = length;
+
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL0, (uint8_t)mode, 1, 0);
+
+    switch (mode) {
+    case CC1101_PKT_LEN_MODE_FIXED:
+        cc1101_write_reg(r, CC1101_REG_PKTLEN, length);
+        break;
+    case CC1101_PKT_LEN_MODE_VARIABLE:
+        /* Indicates the maximum packet length allowed. */
+        cc1101_write_reg(r, CC1101_REG_PKTLEN, length);
+        break;
+    }
+}
+
+void cc1101_set_address_filtering_mode(cc1101_t *r, cc1101_addr_filter_mode_t mode)
+{
+    r->addrFilterMode = mode;
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL1, (uint8_t)mode, 1, 0);
+}
+
+void cc1101_set_crc(cc1101_t *r, bool enable)
+{
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL0, (uint8_t)enable, 2, 2);
+}
+
+void cc1101_set_data_whitening(cc1101_t *r, bool enable)
+{
+    cc1101_write_reg_field(r, CC1101_REG_PKTCTRL0, (uint8_t)enable, 6, 6);
+}
+
+cc1101_status_t cc1101_set_manchester(cc1101_t *r, bool enable)
+{
+    if (enable && (r->mod == CC1101_MOD_MSK || r->mod == CC1101_MOD_4FSK || r->fec)) {
+        return CC1101_STATUS_BAD_STATE;
+    }
+    r->manchester = enable;
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG2, (uint8_t)enable, 3, 3);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_fec(cc1101_t *r, bool enable)
+{
+    if (enable && (r->pktLenMode != CC1101_PKT_LEN_MODE_FIXED || r->manchester)) {
+        return CC1101_STATUS_BAD_STATE;
+    }
+    r->fec = enable;
+    cc1101_write_reg_field(r, CC1101_REG_MDMCFG1, (uint8_t)enable, 7, 7);
+    return CC1101_STATUS_OK;
+}
+
+int8_t cc1101_get_rssi(cc1101_t *r)
+{
+    return ((int8_t)r->rssi / 2) - 74;
+}
+
+uint8_t cc1101_get_lqi(cc1101_t *r)
+{
+    return r->lqi;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Blocking transmit / receive                                               */
+/* -------------------------------------------------------------------------- */
+
+cc1101_status_t cc1101_transmit(cc1101_t *r, const uint8_t *data, size_t length,
+                                 uint8_t addr)
+{
+    size_t cur_pkt_len = length;
+
+    if (r->addrFilterMode != CC1101_ADDR_FILTER_MODE_NONE) {
+        cur_pkt_len++;
+    }
+
+    if (cur_pkt_len > 255) {
+        return CC1101_STATUS_LENGTH_TOO_BIG;
+    }
+
+    if (r->pktLenMode == CC1101_PKT_LEN_MODE_FIXED) {
+        if (cur_pkt_len < r->pktLen) {
+            return CC1101_STATUS_LENGTH_TOO_SMALL;
+        }
+        if (cur_pkt_len > r->pktLen) {
+            return CC1101_STATUS_LENGTH_TOO_BIG;
+        }
+    }
+
+    set_state(r, CC1101_STATE_IDLE);
+    flush_tx_buffer(r);
+
+    uint8_t header_bytes = 0;
+
+    if (r->pktLenMode == CC1101_PKT_LEN_MODE_VARIABLE) {
+        cc1101_write_reg(r, CC1101_REG_FIFO, (uint8_t)cur_pkt_len);
+        header_bytes++;
+    }
+
+    if (r->addrFilterMode != CC1101_ADDR_FILTER_MODE_NONE) {
+        cc1101_write_reg(r, CC1101_REG_FIFO, addr);
+        header_bytes++;
+    }
+
+    /* Fill the FIFO with the first chunk of payload and start transmitting,
+     * then keep topping it up as the chip drains it. */
+    uint8_t first_chunk = CC1101_MIN((uint8_t)length,
+                                      (uint8_t)(CC1101_FIFO_SIZE - header_bytes));
+    cc1101_write_reg_burst(r, CC1101_REG_FIFO, data, first_chunk);
+    size_t data_written = first_chunk;
+
+    set_state(r, CC1101_STATE_TX);
+
+    while (data_written < length) {
+        uint8_t space_in_fifo = wait_for_space_in_fifo(r, 1);
+        if (space_in_fifo == 0) {
+            return abort_transmit(r);
+        }
+        uint8_t bytes_to_write = CC1101_MIN((uint8_t)(length - data_written), space_in_fifo);
+        cc1101_write_reg_burst(r, CC1101_REG_FIFO, data + data_written, bytes_to_write);
+        data_written += bytes_to_write;
+    }
+
+    /* Whole packet is in the FIFO; wait for the chip to transmit it and return
+     * to IDLE on its own (MCSM1.TXOFF_MODE = IDLE). */
+    uint32_t start = cc1101_millis();
+    while (get_state(r) != CC1101_STATE_IDLE) {
+        if (tx_fifo_underflowed(r) || cc1101_millis() - start > CC1101_XMIT_TIMEOUT_MS) {
+            return abort_transmit(r);
+        }
+        cc1101_delay_us(50);
+    }
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_receive(cc1101_t *r, uint8_t *data, size_t length,
+                                size_t *read, uint8_t addr)
+{
+    cc1101_status_t status = cc1101_start_receive(r, addr);
+    if (status != CC1101_STATUS_OK) {
+        return status;
+    }
+    return cc1101_read_data(r, data, length, read);
+}
+
+cc1101_status_t cc1101_read_data(cc1101_t *r, uint8_t *data, size_t length,
+                                  size_t *read)
+{
+    if (read != NULL) {
+        *read = 0;
+    }
+
+    if (length > 255) {
+        return CC1101_STATUS_LENGTH_TOO_BIG;
+    }
+
+    uint8_t header_bytes = 0;
+    uint8_t data_length = r->pktLen;
+
+    if (r->pktLenMode == CC1101_PKT_LEN_MODE_VARIABLE) {
+        if (wait_for_bytes_in_fifo(r, 1) == 0) {
+            return abort_receive(r);
+        }
+        data_length = cc1101_read_reg(r, CC1101_REG_FIFO);
+        header_bytes++;
+    }
+
+    if (r->addrFilterMode != CC1101_ADDR_FILTER_MODE_NONE && data_length > 0) {
+        if (wait_for_bytes_in_fifo(r, 1) == 0) {
+            return abort_receive(r);
+        }
+        (void)cc1101_read_reg(r, CC1101_REG_FIFO);
+        header_bytes++;
+        data_length--;
+    }
+
+    if (data_length > length) {
+        set_state(r, CC1101_STATE_IDLE);
+        flush_rx_buffer(r);
+        return CC1101_STATUS_LENGTH_TOO_SMALL;
+    }
+
+    /* For packets < 64 bytes it is recommended to wait until the complete
+     * packet has been received before reading it out of the RX FIFO. Include
+     * the 2 appended status bytes (RSSI + CRC_OK|LQI) in the count. */
+    uint16_t full_packet = (uint16_t)data_length + 2;
+    if (full_packet <= (uint16_t)(CC1101_FIFO_SIZE - header_bytes)) {
+        if (wait_for_bytes_in_fifo(r, (uint8_t)full_packet) == 0) {
+            return abort_receive(r);
+        }
+    }
+
+    uint8_t data_read = 0;
+    while (data_read < data_length) {
+        uint8_t remaining = data_length - data_read;
+
+        uint8_t bytes_in_fifo = wait_for_bytes_in_fifo(r, 2);
+        if (bytes_in_fifo == 0) {
+            return abort_receive(r);
+        }
+
+        /* Per the datasheet the RX FIFO must never be emptied before the last
+         * byte of the packet has been received, otherwise the last read byte
+         * may be duplicated. Keep one byte back until the whole packet
+         * (payload + 2 appended status bytes) is in the FIFO. */
+        bool full_packet_in_fifo =
+            (uint16_t)bytes_in_fifo >= (uint16_t)remaining + 2;
+        uint8_t readable = full_packet_in_fifo ? bytes_in_fifo
+                                                : (uint8_t)(bytes_in_fifo - 1);
+        uint8_t bytes_to_read = CC1101_MIN(remaining, readable);
+
+        cc1101_read_reg_burst(r, CC1101_REG_FIFO, data + data_read, bytes_to_read);
+        data_read += bytes_to_read;
+    }
+
+    if (wait_for_bytes_in_fifo(r, 2) == 0) {
+        return abort_receive(r);
+    }
+
+    r->rssi = cc1101_read_reg(r, CC1101_REG_FIFO);
+    uint8_t v = cc1101_read_reg(r, CC1101_REG_FIFO);
+    r->lqi = v & 0x7f;
+    bool crc_ok = (v >> 7) & 1;
+
+    set_state(r, CC1101_STATE_IDLE);
+    flush_rx_buffer(r);
+
+    if (read != NULL) {
+        *read = data_length;
+    }
+    return crc_ok ? CC1101_STATUS_OK : CC1101_STATUS_CRC_MISMATCH;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Non-blocking transmit                                                     */
+/* -------------------------------------------------------------------------- */
+
+cc1101_status_t cc1101_start_transmit(cc1101_t *r, const uint8_t *data,
+                                       size_t length, uint8_t addr)
+{
+    size_t cur_pkt_len = length;
+
+    if (r->addrFilterMode != CC1101_ADDR_FILTER_MODE_NONE) {
+        cur_pkt_len++;
+    }
+
+    if (cur_pkt_len > 255) {
+        return CC1101_STATUS_LENGTH_TOO_BIG;
+    }
+
+    if (r->pktLenMode == CC1101_PKT_LEN_MODE_FIXED) {
+        if (cur_pkt_len < r->pktLen) {
+            return CC1101_STATUS_LENGTH_TOO_SMALL;
+        }
+        if (cur_pkt_len > r->pktLen) {
+            return CC1101_STATUS_LENGTH_TOO_BIG;
+        }
+    }
+
+    /* The whole packet (length byte + address byte + payload) must fit in the
+     * TX FIFO; a non-blocking transmit cannot top the FIFO up. Use the blocking
+     * transmit() for longer payloads. */
+    size_t fifo_bytes = cur_pkt_len +
+                        (r->pktLenMode == CC1101_PKT_LEN_MODE_VARIABLE ? 1 : 0);
+    if (fifo_bytes > CC1101_FIFO_SIZE) {
+        return CC1101_STATUS_LENGTH_TOO_BIG;
+    }
+
+    set_state(r, CC1101_STATE_IDLE);
+    flush_tx_buffer(r);
+
+    if (r->pktLenMode == CC1101_PKT_LEN_MODE_VARIABLE) {
+        cc1101_write_reg(r, CC1101_REG_FIFO, (uint8_t)cur_pkt_len);
+    }
+    if (r->addrFilterMode != CC1101_ADDR_FILTER_MODE_NONE) {
+        cc1101_write_reg(r, CC1101_REG_FIFO, addr);
+    }
+
+    cc1101_write_reg_burst(r, CC1101_REG_FIFO, data, length);
+
+    if (r->receiveActionPin != r->transmitActionPin &&
+        is_gdo_pin_configured(r, r->receiveActionPin)) {
+        set_gdo_config(r, r->receiveActionPin, CC1101_GDO_CFG_CONSTANT_LOW);
+    }
+    if (is_gdo_pin_configured(r, r->transmitActionPin)) {
+        set_gdo_config(r, r->transmitActionPin, CC1101_GDO_CFG_SYNC_WORD);
+    }
+
+    set_state(r, CC1101_STATE_TX);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_transmit_action(cc1101_t *r, void (*func)(void),
+                                            cc1101_gdo_pin_t pin)
+{
+    if (!is_gdo_pin_configured(r, pin)) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+    /* Check if the sync word is disabled. */
+    if ((cc1101_read_reg_field(r, CC1101_REG_MDMCFG2, 2, 0) & 0x03) == 0) {
+        return CC1101_STATUS_BAD_STATE;
+    }
+    r->transmitActionPin = pin;
+    set_gdo_config(r, pin, CC1101_GDO_CFG_SYNC_WORD);
+
+    r->tx_action = func;
+    r->tx_action_gpio = gdo_to_gpio(r, pin);
+    cc1101_port_attach_interrupt(r, r->tx_action_gpio, false); /* falling edge */
+    return CC1101_STATUS_OK;
+}
+
+void cc1101_clear_transmit_action(cc1101_t *r)
+{
+    if (!is_gdo_pin_configured(r, r->transmitActionPin)) {
+        return;
+    }
+    cc1101_port_detach_interrupt(r, r->tx_action_gpio);
+    r->tx_action = NULL;
+    r->tx_action_gpio = CC1101_PIN_UNUSED;
+}
+
+cc1101_status_t cc1101_finish_transmit(cc1101_t *r)
+{
+    bool underflow = tx_fifo_underflowed(r);
+    set_state(r, CC1101_STATE_IDLE);
+    flush_tx_buffer(r);
+    return underflow ? CC1101_STATUS_TXFIFO_UNDERFLOW : CC1101_STATUS_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Non-blocking receive                                                      */
+/* -------------------------------------------------------------------------- */
+
+cc1101_status_t cc1101_start_receive(cc1101_t *r, uint8_t addr)
+{
+    cc1101_write_reg(r, CC1101_REG_ADDR, addr);
+
+    set_state(r, CC1101_STATE_IDLE);
+    flush_rx_buffer(r);
+
+    if (r->transmitActionPin != r->receiveActionPin &&
+        is_gdo_pin_configured(r, r->transmitActionPin)) {
+        set_gdo_config(r, r->transmitActionPin, CC1101_GDO_CFG_CONSTANT_LOW);
+    }
+    if (is_gdo_pin_configured(r, r->receiveActionPin)) {
+        set_gdo_config(r, r->receiveActionPin, CC1101_GDO_CFG_RX_FIFO_THR);
+    }
+
+    set_state(r, CC1101_STATE_RX);
+    return CC1101_STATUS_OK;
+}
+
+cc1101_status_t cc1101_set_receive_action(cc1101_t *r, void (*func)(void),
+                                           cc1101_gdo_pin_t pin)
+{
+    if (!is_gdo_pin_configured(r, pin)) {
+        return CC1101_STATUS_INVALID_PARAM;
+    }
+    r->receiveActionPin = pin;
+    set_gdo_config(r, pin, CC1101_GDO_CFG_RX_FIFO_THR);
+
+    r->rx_action = func;
+    r->rx_action_gpio = gdo_to_gpio(r, pin);
+    cc1101_port_attach_interrupt(r, r->rx_action_gpio, true); /* rising edge */
+    return CC1101_STATUS_OK;
+}
+
+void cc1101_clear_receive_action(cc1101_t *r)
+{
+    if (!is_gdo_pin_configured(r, r->receiveActionPin)) {
+        return;
+    }
+    cc1101_port_detach_interrupt(r, r->rx_action_gpio);
+    r->rx_action = NULL;
+    r->rx_action_gpio = CC1101_PIN_UNUSED;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Chip identification                                                       */
+/* -------------------------------------------------------------------------- */
+
+uint8_t cc1101_get_chip_part_number(cc1101_t *r)
+{
+    return cc1101_read_reg(r, CC1101_REG_PARTNUM);
+}
+
+uint8_t cc1101_get_chip_version(cc1101_t *r)
+{
+    return cc1101_read_reg(r, CC1101_REG_VERSION);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Direct register access                                                    */
+/* -------------------------------------------------------------------------- */
+
+uint8_t cc1101_read_reg_field(cc1101_t *r, uint8_t addr, uint8_t hi, uint8_t lo)
+{
+    return (cc1101_read_reg(r, addr) >> lo) & ((1 << (hi - lo + 1)) - 1);
+}
+
+uint8_t cc1101_read_reg(cc1101_t *r, uint8_t addr)
+{
+    uint8_t header = (uint8_t)(CC1101_READ | (addr & 0x3F));
+
+    if (is_status_reg(addr)) {
+        header |= CC1101_BURST;   /* status registers: burst bit on read */
+    }
+
+    chip_select(r);
+    wait_ready(r);
+
+    save_status(r, spi_xfer(r, header));
+    uint8_t data = spi_xfer(r, 0x00);
+
+    chip_deselect(r);
+    return data;
+}
+
+void cc1101_read_reg_burst(cc1101_t *r, uint8_t addr, uint8_t *buff, size_t size)
+{
+    if (is_status_reg(addr)) {
+        return;   /* status registers cannot be burst-read */
+    }
+
+    uint8_t header = (uint8_t)(CC1101_READ | CC1101_BURST | (addr & 0x3F));
+
+    chip_select(r);
+    wait_ready(r);
+
+    save_status(r, spi_xfer(r, header));
+    for (size_t i = 0; i < size; i++) {
+        buff[i] = spi_xfer(r, 0x00);
+    }
+
+    chip_deselect(r);
+}
+
+void cc1101_write_reg_field(cc1101_t *r, uint8_t addr, uint8_t data,
+                             uint8_t hi, uint8_t lo)
+{
+    data <<= lo;
+    uint8_t current = cc1101_read_reg(r, addr);
+    uint8_t mask = (uint8_t)(((1 << (hi - lo + 1)) - 1) << lo);
+    data = (uint8_t)((current & ~mask) | (data & mask));
+    cc1101_write_reg(r, addr, data);
+}
+
+void cc1101_write_reg(cc1101_t *r, uint8_t addr, uint8_t data)
+{
+    if (is_status_reg(addr)) {
+        return;   /* status registers are read-only */
+    }
+
+    uint8_t header = (uint8_t)(CC1101_WRITE | (addr & 0x3F));
+
+    chip_select(r);
+    wait_ready(r);
+
+    save_status(r, spi_xfer(r, header));
+    save_status(r, spi_xfer(r, data));
+
+    chip_deselect(r);
+}
+
+void cc1101_write_reg_burst(cc1101_t *r, uint8_t addr, const uint8_t *data,
+                             size_t size)
+{
+    if (is_status_reg(addr)) {
+        return;   /* status registers are read-only */
+    }
+
+    uint8_t header = (uint8_t)(CC1101_WRITE | CC1101_BURST | (addr & 0x3F));
+
+    chip_select(r);
+    wait_ready(r);
+
+    save_status(r, spi_xfer(r, header));
+    for (size_t i = 0; i < size; i++) {
+        save_status(r, spi_xfer(r, data[i]));
+    }
+
+    chip_deselect(r);
 }
