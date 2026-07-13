@@ -17,6 +17,7 @@
 #define ENABLE_SPI     1
 #define ENABLE_I2C_SCAN 0
 #define ENABLE_CC1101  1
+#define ENABLE_AES     1   /* 1 = AES-128-CCM encrypt/decrypt, 0 = plaintext */
 #define UART_DEBUG      1
 
 /* ===== CC1101 driver (ported from mfurga Arduino library) =====

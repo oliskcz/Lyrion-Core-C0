@@ -23,3 +23,10 @@ Release/
 
 # Temp files
 *~
+
+# AES key (never commit real keys — see key.h.example)
+Drivers/Crypto/key.h
+
+# Lyrion Link datasheets (private — kept local or in the private repo)
+LYRION_LINK.md
+LYRION_LINK_PUBLIC.md

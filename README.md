@@ -302,6 +302,7 @@ RSSI: -75 dBm  LQI:120 ← RSSI + link quality
 | `ENABLE_TMP102` | 1 | Temperature sensor |
 | `ENABLE_SPI` | 1 | SPI1 for CC1101 |
 | `ENABLE_CC1101` | 1 | CC1101 radio driver (master enable) |
+| `ENABLE_AES` | 1 | AES-128-CCM encryption (0 = plaintext) |
 | `CC1101_ENABLE_RADIO1` | 1 | J1 module on/off |
 | `CC1101_ENABLE_RADIO2` | 1 | J3 module on/off |
 | `CC1101_CRYSTAL_FREQ` | 26 | CC1101 reference crystal (MHz) |
@@ -328,6 +329,18 @@ Drivers/
   │    ├── cc1101.c        protocol logic (SPI regs, freq/power, TX/RX)
   │    ├── cc1101_port.h   STM32 HAL glue declarations
   │    └── cc1101_port.c   HAL glue: SPI/GPIO/timing, EXTI registry
+  ├── Crypto/
+  │    ├── aes128.h        AES-128 encrypt + decrypt API
+  │    ├── aes128.c        S-box + key expansion + cipher rounds
+  │    ├── ccm.h           CCM encode/decode API (with AAD)
+  │    ├── ccm.c           CCM mode logic (CBC-MAC + CTR)
+  │    ├── key.h.example   template (committed)
+  │    └── key.h           actual key + nonce prefix (git-ignored)
+  ├── LyrionLink/
+  │    ├── lyrion_link.h   public API: init, task, send, callbacks
+  │    ├── lyrion_link.c   core: state, dispatch, AES-CCM + SEQ
+  │    ├── lyrion_link_types.h  enums, flags, error codes
+  │    └── lyrion_link_packet.h/c  wire format pack/unpack/AAD
   ├── OLED/
   │    ├── ssd1306.c       I2C OLED controller
   │    └── ssd1306.h
@@ -338,6 +351,62 @@ Drivers/
        ├── ws2812.c        PWM+DMA addressable LED driver
        └── ws2812.h
 ```
+
+---
+
+## AES-128-CCM Encryption (`Drivers/Crypto/`)
+
+The CC1101 link supports optional AES-128-CCM encryption + authentication, toggled
+by `ENABLE_AES` in `config.h`. When enabled, the receiver decrypts and verifies each
+packet before displaying it on the OLED.
+
+### Config
+
+```c
+#define ENABLE_AES  1   // 1 = encrypted, 0 = plaintext
+```
+
+### Key provisioning
+
+1. Copy `Drivers/Crypto/key.h.example` to `Drivers/Crypto/key.h`.
+2. Replace the 16-byte `AES_KEY` and 9-byte `AES_NONCE_PREFIX` with your own random
+   values.
+3. `key.h` is git-ignored — never commit real keys.
+4. The same key and nonce prefix must be used on both the STM32 receiver and the
+   Arduino transmitter.
+
+### Packet format (CCM-encrypted)
+
+```
+Offset  Content                     Size
+0-3     packet counter (big-endian) 4 bytes (sent in clear)
+4..N-4  ciphertext                   variable (same length as plaintext)
+N-4..N  encrypted MAC tag            4 bytes
+```
+
+Overhead: 8 bytes/packet (55 bytes max payload, down from 63).
+
+CCM parameters: L=2, M=4, 13-byte nonce (9-byte prefix + 4-byte counter), no AAD.
+The counter is authenticated indirectly through the CCM nonce — flipping a counter bit
+causes MAC verification to fail.
+
+### Error display on OLED
+
+| Condition | OLED message | Cause |
+|-----------|-------------|-------|
+| Valid packet | `RX: <decrypted msg>` | Normal operation |
+| CC1101 CRC fail | `CRC ERR` | Transmission bit error (hardware CRC-16 caught it) |
+| CCM MAC fail | `MAC FAIL` | Deliberate tampering (CRC passed but MAC doesn't match) |
+| Replay | `REPLAY!` | Counter <= last seen (packet was recorded and retransmitted) |
+
+### Flash / RAM cost
+
+| Component | Flash | RAM |
+|-----------|-------|-----|
+| AES-128 encrypt core (S-box + cipher) | ~1.2 KB code + 256 B rodata | 176 B (round keys) |
+| CCM encode + decode | ~0.8 KB | 32 B (stack) |
+| Integration (nonce, replay check) | ~0.4 KB | 12 B |
+| **Total** | **~2.5 KB** | **~220 B** |
 
 ---
 

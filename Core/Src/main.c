@@ -37,6 +37,11 @@
 	#include "cc1101.h"
 	#include "cc1101_port.h"
 #endif
+#if ENABLE_AES
+	#include "aes128.h"
+	#include "ccm.h"
+	#include "key.h"
+#endif
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -73,6 +78,7 @@ uint8_t rxByte;
 uint32_t lastTick = 0;
 volatile uint8_t led_event = 0;       /* set to 1 by EXTI callback (LED toggled) */
 #if ENABLE_I2C_SCAN
+static const char hex_chars[] = "0123456789ABCDEF";
 uint32_t i2c_scan_lastTick = 0;
 uint32_t i2c_scan_address = 0;   /* 0 = idle, 1-127 = currently scanning */
 uint8_t  i2c_scan_found = 0;    /* device count during current scan */
@@ -90,6 +96,11 @@ uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
   static int8_t     cc1101_rx_rssi   = 0;
   static uint8_t    cc1101_rx_lqi    = 0;
   static volatile bool cc1101_rx_ready = false;
+  #if ENABLE_AES
+  static aes128_ctx_t aes_ctx;
+  static uint32_t     rx_last_counter       = 0;
+  static bool         rx_counter_initialized = false;
+  #endif
   #endif
   /* USER CODE END PV */
 
@@ -137,7 +148,7 @@ static int uitoa(uint32_t value, char *out)
     return len;
 }
 
-static const char hex_chars[] = "0123456789ABCDEF";
+
 
 #if ENABLE_TMP102 && ENABLE_OLED
 /* Draw temperature on OLED line y=24 (blue area). */
@@ -418,6 +429,10 @@ int main(void)
           cc1101_set_manchester(r, false);
           cc1101_set_fec(r, false);
 
+          #if ENABLE_AES
+          aes128_init(&aes_ctx, AES_KEY);
+          #endif
+
           cc1101_set_receive_action(r, on_cc1101_rx_data, CC1101_GDO0);
           cc1101_start_receive(r, 0);
       }
@@ -443,21 +458,68 @@ int main(void)
 
 	    uint8_t rx_buf[64];
 	    size_t  rx_len = 0;
-
 	    cc1101_status_t st = cc1101_read_data(cc1101_radio1, rx_buf,
 	                                           sizeof(rx_buf), &rx_len);
+
+	  #if ENABLE_AES
+	    if (st == CC1101_STATUS_OK && rx_len >= 8) {
+	        uint32_t pkt_counter = ((uint32_t)rx_buf[0] << 24) |
+	                               ((uint32_t)rx_buf[1] << 16) |
+	                               ((uint32_t)rx_buf[2] << 8)  |
+	                               (uint32_t)rx_buf[3];
+
+	        if (rx_counter_initialized && pkt_counter <= rx_last_counter) {
+	            memcpy(cc1101_rx_msg, "REPLAY!", 8);
+	            cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
+	            cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	        } else {
+	            uint8_t nonce[13];
+	            memcpy(nonce, AES_NONCE_PREFIX, 9);
+	            memcpy(nonce + 9, rx_buf, 4);
+
+	            uint8_t plaintext[55];
+	            int pt_len = ccm_decode(&aes_ctx, nonce,
+	                                    rx_buf + 4, rx_len - 4, plaintext);
+	            if (pt_len >= 0) {
+	                rx_last_counter = pkt_counter;
+	                rx_counter_initialized = true;
+	                size_t copy_len = (size_t)pt_len;
+	                if (copy_len >= sizeof(cc1101_rx_msg))
+	                    copy_len = sizeof(cc1101_rx_msg) - 1;
+	                memcpy(cc1101_rx_msg, plaintext, copy_len);
+	                cc1101_rx_msg[copy_len] = '\0';
+	                cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
+	                cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	                #if ENABLE_UART1 && UART_DEBUG
+	                HAL_UART_Transmit(&huart1, (uint8_t *)"RX OK\r\n", 7, 100);
+	                #endif
+	            } else {
+	                memcpy(cc1101_rx_msg, "MAC FAIL", 9);
+	                cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
+	                cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	                #if ENABLE_UART1 && UART_DEBUG
+	                HAL_UART_Transmit(&huart1, (uint8_t *)"MAC FAIL\r\n", 9, 100);
+	                #endif
+	            }
+	        }
+	    } else if (st == CC1101_STATUS_CRC_MISMATCH) {
+	        memcpy(cc1101_rx_msg, "CRC ERR", 8);
+	        cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
+	        cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	        #if ENABLE_UART1 && UART_DEBUG
+	        HAL_UART_Transmit(&huart1, (uint8_t *)"CRC ERR\r\n", 9, 100);
+	        #endif
+	    }
+	  #else
 	    if (st == CC1101_STATUS_OK) {
 	        rx_buf[rx_len] = '\0';
-
 	        size_t copy_len = rx_len;
 	        if (copy_len >= sizeof(cc1101_rx_msg))
 	            copy_len = sizeof(cc1101_rx_msg) - 1;
 	        memcpy(cc1101_rx_msg, rx_buf, copy_len);
 	        cc1101_rx_msg[copy_len] = '\0';
-
 	        cc1101_rx_rssi  = cc1101_get_rssi(cc1101_radio1);
 	        cc1101_rx_lqi   = cc1101_get_lqi(cc1101_radio1);
-
 	        #if ENABLE_UART1 && UART_DEBUG
 	        HAL_UART_Transmit(&huart1, (uint8_t *)"RX OK\r\n", 7, 100);
 	        #endif
@@ -469,6 +531,7 @@ int main(void)
 	        HAL_UART_Transmit(&huart1, (uint8_t *)"CRC ERR\r\n", 9, 100);
 	        #endif
 	    }
+	  #endif
 
 	    #if ENABLE_OLED
 	    oled_show_rx(cc1101_rx_msg, cc1101_rx_rssi, cc1101_rx_lqi);
