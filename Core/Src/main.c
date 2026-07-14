@@ -98,8 +98,7 @@ uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
   static volatile bool cc1101_rx_ready = false;
   #if ENABLE_AES
   static aes128_ctx_t aes_ctx;
-  static uint32_t     rx_last_counter       = 0;
-  static bool         rx_counter_initialized = false;
+  static uint8_t      rx_last_seq = 0xFF;  // force first packet to always be accepted
   #endif
   #endif
   /* USER CODE END PV */
@@ -462,27 +461,34 @@ int main(void)
 	                                           sizeof(rx_buf), &rx_len);
 
 	  #if ENABLE_AES
+	    /* Minimum valid encrypted packet: 1 B SEQ + 3 B nonce_ext + 0 B payload + 4 B MAC = 8 B */
 	    if (st == CC1101_STATUS_OK && rx_len >= 8) {
-	        uint32_t pkt_counter = ((uint32_t)rx_buf[0] << 24) |
-	                               ((uint32_t)rx_buf[1] << 16) |
-	                               ((uint32_t)rx_buf[2] << 8)  |
-	                               (uint32_t)rx_buf[3];
+	        uint8_t seq_rx   = rx_buf[0];
+	        /* nonce_ext[0..2] = rx_buf[1..3] */
 
-	        if (rx_counter_initialized && pkt_counter <= rx_last_counter) {
-	            memcpy(cc1101_rx_msg, "REPLAY!", 8);
+	        if (seq_rx == rx_last_seq) {
+	            memcpy(cc1101_rx_msg, "DUPLICATE", 10);
 	            cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
 	            cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
+	            #if ENABLE_UART1 && UART_DEBUG
+	            HAL_UART_Transmit(&huart1, (uint8_t *)"DUPLICATE\r\n", 10, 100);
+	            #endif
 	        } else {
+	            /* 13-byte CCM nonce: prefix(7) + net_id(2) + seq(1) + nonce_ext(3) */
 	            uint8_t nonce[13];
-	            memcpy(nonce, AES_NONCE_PREFIX, 9);
-	            memcpy(nonce + 9, rx_buf, 4);
+	            memcpy(nonce, AES_NONCE_PREFIX, 7);
+	            nonce[7] = (LL_NETWORK_ID >> 8) & 0xFF;
+	            nonce[8] = LL_NETWORK_ID & 0xFF;
+	            nonce[9] = seq_rx;
+	            nonce[10] = rx_buf[1];
+	            nonce[11] = rx_buf[2];
+	            nonce[12] = rx_buf[3];
 
-	            uint8_t plaintext[55];
+	            /* AAD not used in this prototype — CCM without AAD */
 	            int pt_len = ccm_decode(&aes_ctx, nonce,
-	                                    rx_buf + 4, rx_len - 4, plaintext);
+	                                     rx_buf + 4, rx_len - 4, plaintext);
 	            if (pt_len >= 0) {
-	                rx_last_counter = pkt_counter;
-	                rx_counter_initialized = true;
+	                rx_last_seq = seq_rx;
 	                size_t copy_len = (size_t)pt_len;
 	                if (copy_len >= sizeof(cc1101_rx_msg))
 	                    copy_len = sizeof(cc1101_rx_msg) - 1;

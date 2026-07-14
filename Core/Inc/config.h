@@ -43,3 +43,6 @@
 #define SSD1306_INCLUDE_FONT_16x26	0
 #define SSD1306_INCLUDE_FONT_16x24	0
 #define SSD1306_INCLUDE_FONT_16x15	0
+
+/* Network identity (Lyrion Link protocol). Must match on every node. */
+#define LL_NETWORK_ID   0x0001
