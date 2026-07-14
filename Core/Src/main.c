@@ -42,6 +42,11 @@
 	#include "ccm.h"
 	#include "key.h"
 #endif
+#if ENABLE_CC1101
+	#include "lyrion_link.h"
+	#include "lyrion_link_types.h"
+	#include "lyrion_link_packet.h"
+#endif
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -96,10 +101,6 @@ uint8_t  i2c_found_addrs[16];   /* addresses of found devices (7-bit) */
   static int8_t     cc1101_rx_rssi   = 0;
   static uint8_t    cc1101_rx_lqi    = 0;
   static volatile bool cc1101_rx_ready = false;
-  #if ENABLE_AES
-  static aes128_ctx_t aes_ctx;
-  static uint8_t      rx_last_seq = 0xFF;  // force first packet to always be accepted
-  #endif
   #endif
   /* USER CODE END PV */
 
@@ -227,6 +228,60 @@ static void oled_show_rx(const char *msg, int8_t rssi, uint8_t lqi)
     buf[idx] = '\0';
     ssd1306_WriteString(buf, Font_6x8, White);
 }
+#endif
+
+#if ENABLE_CC1101 && ENABLE_AES
+/* Lyrion Link callback: when a text packet is received, display it on
+ * the OLED and print to UART. */
+static void ll_on_text(uint16_t src, const char *text, size_t len,
+                       int8_t rssi, uint8_t lqi)
+{
+    #if ENABLE_UART1 && UART_DEBUG
+    char buf[48];
+    int idx = 0;
+    static const char p0[] = "LL RX 0x";
+    memcpy(&buf[idx], p0, sizeof(p0) - 1); idx += (int)(sizeof(p0) - 1);
+    idx += uitoa(src, &buf[idx]);  /* hex would be better but uitoa is dec */
+    static const char p1[] = " RSSI=";
+    memcpy(&buf[idx], p1, sizeof(p1) - 1); idx += (int)(sizeof(p1) - 1);
+    if (rssi < 0) { buf[idx++] = '-'; rssi = -rssi; }
+    idx += uitoa((uint32_t)rssi, &buf[idx]);
+    static const char p2[] = " LQI=";
+    memcpy(&buf[idx], p2, sizeof(p2) - 1); idx += (int)(sizeof(p2) - 1);
+    idx += uitoa(lqi, &buf[idx]);
+    static const char p3[] = ": ";
+    memcpy(&buf[idx], p3, sizeof(p3) - 1); idx += (int)(sizeof(p3) - 1);
+    buf[idx] = '\0';
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, idx, 100);
+    HAL_UART_Transmit(&huart1, (uint8_t *)text, len, 100);
+    HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 100);
+    #endif
+
+    #if ENABLE_OLED
+    char oled_buf[22];
+    int oi = 0;
+    static const char op0[] = "R:";
+    memcpy(&oled_buf[oi], op0, sizeof(op0) - 1); oi += (int)(sizeof(op0) - 1);
+    if (rssi < 0) { oled_buf[oi++] = '-'; rssi = -rssi; }
+    oi += uitoa((uint32_t)rssi, &oled_buf[oi]);
+    static const char op1[] = " LQI:";
+    memcpy(&oled_buf[oi], op1, sizeof(op1) - 1); oi += (int)(sizeof(op1) - 1);
+    oi += uitoa(lqi, &oled_buf[oi]);
+    oled_buf[oi] = '\0';
+
+    ssd1306_FillRectangle(2, 16, 127, 31, Black);
+    ssd1306_SetCursor(2, 16);
+    ssd1306_WriteString("RX: ", Font_6x8, White);
+    ssd1306_WriteString(text, Font_6x8, White);
+    ssd1306_SetCursor(2, 24);
+    ssd1306_WriteString(oled_buf, Font_6x8, White);
+    ssd1306_UpdateScreen();
+    #endif
+}
+
+static const ll_callbacks_t ll_cbs = {
+    .on_text_received = ll_on_text,
+};
 #endif
 
 /* USER CODE END 0 */
@@ -428,8 +483,22 @@ int main(void)
           cc1101_set_manchester(r, false);
           cc1101_set_fec(r, false);
 
-          #if ENABLE_AES
-          aes128_init(&aes_ctx, AES_KEY);
+          #if ENABLE_CC1101 && ENABLE_AES
+          /* Initialise Lyrion Link protocol stack. The library handles
+           * AES-CCM encryption, packet framing, and SEQ duplicate
+           * detection. The callbacks were registered earlier in USER CODE 0. */
+          ll_config_t ll_cfg = {
+              .address              = LL_NODE_ADDRESS,
+              .network_id           = LL_NETWORK_ID,
+              .band                 = LL_BAND,
+              .channel_hz           = 433800000,
+              .data_rate_index      = 1,    /* 10 kBaud */
+              .output_power_index   = 7,    /* +10 dBm */
+              .beacon_interval_s    = 0,    /* disabled */
+              .mesh_enabled         = false,
+          };
+          ll_set_callbacks(&ll_cbs);
+          ll_init(&ll_cfg);
           #endif
 
           cc1101_set_receive_action(r, on_cc1101_rx_data, CC1101_GDO0);
@@ -452,71 +521,18 @@ int main(void)
 	#endif
 
 	#if ENABLE_CC1101
+	#if ENABLE_CC1101 && ENABLE_AES
+	/* Lyrion Link: handles AES-CCM RX, SEQ duplicate detection, and
+	 * message dispatch via callbacks registered in USER CODE 0. */
+	ll_task();
+	#else
+	/* Plaintext CC1101 RX (no encryption). */
 	if (cc1101_radio1 && cc1101_rx_ready) {
 	    cc1101_rx_ready = false;
-
 	    uint8_t rx_buf[64];
 	    size_t  rx_len = 0;
 	    cc1101_status_t st = cc1101_read_data(cc1101_radio1, rx_buf,
 	                                           sizeof(rx_buf), &rx_len);
-
-	  #if ENABLE_AES
-	    /* Minimum valid encrypted packet: 1 B SEQ + 3 B nonce_ext + 0 B payload + 4 B MAC = 8 B */
-	    if (st == CC1101_STATUS_OK && rx_len >= 8) {
-	        uint8_t seq_rx   = rx_buf[0];
-	        /* nonce_ext[0..2] = rx_buf[1..3] */
-
-	        if (seq_rx == rx_last_seq) {
-	            memcpy(cc1101_rx_msg, "DUPLICATE", 10);
-	            cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
-	            cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
-	            #if ENABLE_UART1 && UART_DEBUG
-	            HAL_UART_Transmit(&huart1, (uint8_t *)"DUPLICATE\r\n", 10, 100);
-	            #endif
-	        } else {
-	            /* 13-byte CCM nonce: prefix(7) + net_id(2) + seq(1) + nonce_ext(3) */
-	            uint8_t nonce[13];
-	            memcpy(nonce, AES_NONCE_PREFIX, 7);
-	            nonce[7] = (LL_NETWORK_ID >> 8) & 0xFF;
-	            nonce[8] = LL_NETWORK_ID & 0xFF;
-	            nonce[9] = seq_rx;
-	            nonce[10] = rx_buf[1];
-	            nonce[11] = rx_buf[2];
-	            nonce[12] = rx_buf[3];
-
-	            /* AAD not used in this prototype — CCM without AAD */
-	            int pt_len = ccm_decode(&aes_ctx, nonce,
-	                                     rx_buf + 4, rx_len - 4, plaintext);
-	            if (pt_len >= 0) {
-	                rx_last_seq = seq_rx;
-	                size_t copy_len = (size_t)pt_len;
-	                if (copy_len >= sizeof(cc1101_rx_msg))
-	                    copy_len = sizeof(cc1101_rx_msg) - 1;
-	                memcpy(cc1101_rx_msg, plaintext, copy_len);
-	                cc1101_rx_msg[copy_len] = '\0';
-	                cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
-	                cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
-	                #if ENABLE_UART1 && UART_DEBUG
-	                HAL_UART_Transmit(&huart1, (uint8_t *)"RX OK\r\n", 7, 100);
-	                #endif
-	            } else {
-	                memcpy(cc1101_rx_msg, "MAC FAIL", 9);
-	                cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
-	                cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
-	                #if ENABLE_UART1 && UART_DEBUG
-	                HAL_UART_Transmit(&huart1, (uint8_t *)"MAC FAIL\r\n", 9, 100);
-	                #endif
-	            }
-	        }
-	    } else if (st == CC1101_STATUS_CRC_MISMATCH) {
-	        memcpy(cc1101_rx_msg, "CRC ERR", 8);
-	        cc1101_rx_rssi = cc1101_get_rssi(cc1101_radio1);
-	        cc1101_rx_lqi  = cc1101_get_lqi(cc1101_radio1);
-	        #if ENABLE_UART1 && UART_DEBUG
-	        HAL_UART_Transmit(&huart1, (uint8_t *)"CRC ERR\r\n", 9, 100);
-	        #endif
-	    }
-	  #else
 	    if (st == CC1101_STATUS_OK) {
 	        rx_buf[rx_len] = '\0';
 	        size_t copy_len = rx_len;
@@ -537,15 +553,13 @@ int main(void)
 	        HAL_UART_Transmit(&huart1, (uint8_t *)"CRC ERR\r\n", 9, 100);
 	        #endif
 	    }
-	  #endif
-
 	    #if ENABLE_OLED
 	    oled_show_rx(cc1101_rx_msg, cc1101_rx_rssi, cc1101_rx_lqi);
 	    ssd1306_UpdateScreen();
 	    #endif
-
 	    cc1101_start_receive(cc1101_radio1, 0);
 	}
+	#endif
 	#endif
 
 	if (HAL_GetTick() - lastTick >= 1000)

@@ -48,8 +48,9 @@
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/OLED}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/TMP102}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/CC1101}&quot;"/>
-									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/Crypto}&quot;"/>
-									<listOptionValue builtIn="false" value="../Drivers/STM32C0xx_HAL_Driver/Inc"/>
+								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/Crypto}&quot;"/>
+								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/LyrionLink}&quot;"/>
+								<listOptionValue builtIn="false" value="../Drivers/STM32C0xx_HAL_Driver/Inc"/>
 									<listOptionValue builtIn="false" value="../Drivers/STM32C0xx_HAL_Driver/Inc/Legacy"/>
 									<listOptionValue builtIn="false" value="../Drivers/CMSIS/Device/ST/STM32C0xx/Include"/>
 									<listOptionValue builtIn="false" value="../Drivers/CMSIS/Include"/>
@@ -132,6 +133,7 @@
 								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/TMP102}&quot;"/>
 								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/CC1101}&quot;"/>
 								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/Crypto}&quot;"/>
+								<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Drivers/LyrionLink}&quot;"/>
 								<listOptionValue builtIn="false" value="../Drivers/STM32C0xx_HAL_Driver/Inc"/>
 								<listOptionValue builtIn="false" value="../Drivers/STM32C0xx_HAL_Driver/Inc/Legacy"/>
 								<listOptionValue builtIn="false" value="../Drivers/CMSIS/Device/ST/STM32C0xx/Include"/>

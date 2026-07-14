@@ -46,3 +46,13 @@
 
 /* Network identity (Lyrion Link protocol). Must match on every node. */
 #define LL_NETWORK_ID   0x0001
+
+/* Lyrion Link node address (0x0001-0xFFFE; 0xFFFF is broadcast). */
+#define LL_NODE_ADDRESS  0x0001
+
+/* Lyrion Link band (0=315, 1=433, 2=868, 3=915 MHz). */
+#define LL_BAND            1
+
+/* Lyrion Link build tier: Lite (CC1101 only) or Pro (mesh later). */
+#define LL_LITE_BUILD  1
+#define LL_PRO_BUILD   0
