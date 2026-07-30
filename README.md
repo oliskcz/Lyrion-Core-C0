@@ -1,22 +1,51 @@
-# STM32 Lyrion Core C0
+<p align="center">
+  <h1 align="center">Lyrion Core C0</h1>
+  <p align="center">
+    <strong>STM32C031G6UX Development Board Firmware</strong><br>
+    CC1101 sub-1 GHz RF, I2C OLED, TMP102 temperature sensing, and WS2812B addressable LEDs
+  </p>
+</p>
 
-Firmware for the **Lyrion Core C0 development board** — an **STM32C031G6UX**-based platform for prototyping with **CC1101 sub-1 GHz RF modules** (Lyrion Link series), I2C OLED, temperature sensing, and addressable LEDs.
+<p align="center">
+  <a href="#current-status"><img alt="Status: In Development" src="https://img.shields.io/badge/Status-In%20Development-bf8700?style=flat-square"></a>
+  <a href="#board-features"><img alt="MCU: STM32C031" src="https://img.shields.io/badge/MCU-STM32C031-0969da?style=flat-square"></a>
+  <a href="#cc1101-driver-driverscc1101"><img alt="Radio: CC1101" src="https://img.shields.io/badge/Radio-CC1101-6639ba?style=flat-square"></a>
+  <a href="#license"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/License-GPL--3.0-1a7f37?style=flat-square"></a>
+</p>
+
+---
+
+## Table of Contents
+
+1. [Current Status](#current-status)
+2. [Board Features](#board-features)
+3. [CC1101 Driver](#cc1101-driver-driverscc1101)
+4. [Display (OLED)](#display-oled-12864)
+5. [Configuration](#configuration-coreincconfigh)
+6. [File Structure](#file-structure)
+7. [EXTI Interrupts](#exti-interrupts)
+8. [Building](#building)
+9. [License](#license)
+
+---
+
+This is the firmware for the **Lyrion Core C0 development board**, an **STM32C031G6UX** based platform for prototyping with **CC1101 sub-1 GHz RF modules** (Lyrion Link series), an I2C OLED, temperature sensing, and addressable LEDs.
 
 ## Current Status
 
 The CC1101 driver has been ported from the Arduino library by Mateusz Furga
-([mfurga/CC1101](https://github.com/mfurga/CC1101)) to plain C for STM32 HAL.
+([mfurga/CC1101](https://github.com/mfurga/CC1101)) to plain C for the STM32 HAL.
 The board runs in **interrupt-driven receive mode**, displaying received packets
 and RSSI on the OLED. The AliExpress CC1101 module has been confirmed to
-successfully transmit to the Lyrion Link module.
+transmit successfully to the Lyrion Link module.
 
 ### Flash optimisation
 
-The original port used `double` throughout, pulling ~12 KB of software
+The original port used `double` throughout, which pulled in about 12 KB of software
 double-precision math routines (`__aeabi_d*`) on the Cortex-M0+ (no FPU).
-All arithmetic was converted to `float`, and `log2`/`round`/`fabs` were replaced
+All arithmetic was converted to `float`, and `log2`, `round`, and `fabs` were replaced
 with lightweight inline equivalents. The double math library is no longer linked,
-saving ~11 KB of flash.
+which saves about 11 KB of flash.
 
 ---
 
@@ -37,42 +66,43 @@ saving ~11 KB of flash.
 
 ## CC1101 Driver (`Drivers/CC1101/`)
 
-C port of the **Arduino CC1101 library by Mateusz Furga**
+This is a C port of the **Arduino CC1101 library by Mateusz Furga**
 ([mfurga/CC1101](https://github.com/mfurga/CC1101)) for the STM32 HAL. The full
-public API and behaviour of the original library is preserved; the C++ `Radio`
+public API and behaviour of the original library is preserved, and the C++ `Radio`
 class is replaced by a `cc1101_t` instance struct passed as the first argument
-to every function, enabling multiple independent radios on the shared SPI bus.
+to every function, which enables multiple independent radios on the shared SPI bus.
 
 **Files:**
+
 | File | Purpose |
 |------|---------|
 | `cc1101.h` / `cc1101.c` | Portable protocol logic: register map, enums, frequency/power/TX/RX |
 | `cc1101_port.h` / `cc1101_port.c` | STM32 HAL glue: SPI transfer, GPIO, timing, EXTI registry + dispatcher |
 
-**Key features (full fidelity with the original):**
-- Modulations: ASK/OOK, 2-FSK, GFSK, 4-FSK, MSK
-- Frequency bands 300-348 / 387-464 / 779-928 MHz, channel grid, data rate, RX bandwidth
-- Output power -30..+10 dBm (PATABLE), per-band tables
-- Packet format: fixed/variable length, address filtering, CRC, data whitening, Manchester, FEC
-- **Blocking** TX/RX (`cc1101_transmit`, `cc1101_receive`) and **interrupt-driven** TX/RX
-  (`cc1101_start_transmit` / `set_transmit_action` / `finish_transmit`,
-  `cc1101_start_receive` / `set_receive_action` / `cc1101_read_data`)
-- Direct register access (`cc1101_read_reg` / `write_reg` + field/burst variants)
-- RSSI / LQI readback, chip ID check, datasheet errata workarounds (FIFO byte re-read)
+**Key features (full fidelity with the original).** Supported modulations are
+ASK/OOK, 2-FSK, GFSK, 4-FSK, and MSK, across the 300 to 348, 387 to 464, and
+779 to 928 MHz bands, with a configurable channel grid, data rate, and RX bandwidth.
+Output power spans −30 to +10 dBm via PATABLE with per-band tables. The packet
+format supports fixed or variable length, address filtering, CRC, data whitening,
+Manchester encoding, and FEC. Both **blocking** TX/RX (`cc1101_transmit`,
+`cc1101_receive`) and **interrupt-driven** TX/RX (`cc1101_start_transmit` /
+`set_transmit_action` / `finish_transmit`, `cc1101_start_receive` /
+`set_receive_action` / `cc1101_read_data`) are available, along with direct
+register access (`cc1101_read_reg` / `write_reg` plus field and burst variants),
+RSSI and LQI readback, chip ID check, and the datasheet errata workarounds
+(FIFO byte re-read).
 
-**Multi-radio / EXTI model:**
-- The board has two CC1101 sockets: **J1** (CS1=PA11, GDO0=PA12, GDO2=PB3) and
-  **J3** (CS2=PC6, GDO0=PA2, GDO2=PA15), sharing SPI1. Each is a separate
-  `cc1101_t` instance.
-- Interrupt callbacks use a registry + dispatcher: `set_receive_action` /
-  `set_transmit_action` configure the GDO pin's EXTI edge and unmask it after
-  the GDO signal is configured; the application's `HAL_GPIO_EXTI_Rising/Falling_Callback`
-  forwards to `cc1101_on_rising_edge()` / `cc1101_on_falling_edge()`, which
-  dispatch to the registered user callback. ISRs stay tiny (set a flag only).
-- GDO EXTI lines are **masked at boot** (`EXTI->IMR1` in `MX_GPIO_Init`) to
-  prevent the CC1101's default 26 MHz GDO clock output from causing an ISR
-  livelock before `cc1101_init` writes IOCFG. The library unmasks a line only
-  when `set_*_action` is called.
+**Multi-radio and EXTI model.** The board has two CC1101 sockets, **J1**
+(CS1=PA11, GDO0=PA12, GDO2=PB3) and **J3** (CS2=PC6, GDO0=PA2, GDO2=PA15), which
+share SPI1, and each is a separate `cc1101_t` instance. Interrupt callbacks use a
+registry and dispatcher: `set_receive_action` / `set_transmit_action` configure the
+GDO pin's EXTI edge and unmask it after the GDO signal is configured, and the
+application's `HAL_GPIO_EXTI_Rising/Falling_Callback` forwards to
+`cc1101_on_rising_edge()` / `cc1101_on_falling_edge()`, which dispatch to the
+registered user callback. ISRs stay tiny and only set a flag. The GDO EXTI lines
+are **masked at boot** (`EXTI->IMR1` in `MX_GPIO_Init`) to prevent the CC1101's
+default 26 MHz GDO clock output from causing an ISR livelock before `cc1101_init`
+writes IOCFG, and the library unmasks a line only when `set_*_action` is called.
 
 **Config (`Core/Inc/config.h`):**
 ```c
@@ -82,12 +112,12 @@ to every function, enabling multiple independent radios on the shared SPI bus.
 #define CC1101_CRYSTAL_FREQ   26  // MHz (verify on module)
 ```
 
-**Do not call CC1101 SPI APIs from ISRs** — ISRs only set flags; all SPI work
+**Do not call CC1101 SPI APIs from ISRs.** ISRs only set flags, and all SPI work
 happens in the main loop. The two radios share SPI1 with no mutual exclusion.
 
 ### Using the library from `main.c`
 
-The driver is plain C — there is no Arduino-style `Radio` object to construct.
+The driver is plain C, so there is no Arduino-style `Radio` object to construct.
 You declare a `cc1101_t` per physical module, fill in a `cc1101_config_t` with
 its pins, call `cc1101_init()`, then configure and use it.
 
@@ -110,9 +140,9 @@ cc1101_t radio2;
 **2. Initialise after `MX_SPI1_Init()`**
 
 `cc1101_init()` takes a hardware binding (SPI handle, CS port/pin, MISO
-port/pin for `waitReady()` polling, and the two GDO pins — set to
+port/pin for `waitReady()` polling, and the two GDO pins, set to
 `CC1101_PIN_UNUSED` if not wired). The last two arguments are the initial
-modulation, frequency (MHz) and data rate (kBaud); you can change them
+modulation, frequency (MHz), and data rate (kBaud), and you can change them
 afterwards.
 
 ```c
@@ -130,8 +160,8 @@ if (st != CC1101_STATUS_OK) { /* error handling */ }
 
 **3. Configure radio parameters (mirror of the Arduino setters)**
 
-All `set_*` calls are void or return a `cc1101_status_t`; the Arduino settings
-you quoted map one-to-one:
+All `set_*` calls are void or return a `cc1101_status_t`, and the Arduino
+settings map one-to-one:
 
 ```c
 cc1101_set_modulation(&radio1, CC1101_MOD_ASK_OOK);
@@ -156,11 +186,11 @@ Other available setters: `cc1101_set_channel`, `cc1101_set_channel_spacing`,
 **4. Blocking transmit / receive**
 
 The blocking API takes a `cc1101_t *`, a buffer, a length, and (for
-`cc1101_transmit`/`cc1101_receive`) an optional address byte for hardware
+`cc1101_transmit` / `cc1101_receive`) an optional address byte for hardware
 address filtering. `cc1101_transmit` returns once the packet has been fully
-emitted; `cc1101_receive` returns once a packet arrives or after
+emitted, and `cc1101_receive` returns once a packet arrives or after
 `CC1101_RECV_TIMEOUT_MS` (250 ms default, down from the original 5 s for this
-project — defined in `cc1101.h`).
+project, defined in `cc1101.h`).
 
 ```c
 uint8_t tx_buf[] = "Hello world";
@@ -180,7 +210,7 @@ if (rx_st == CC1101_STATUS_OK) {
 **5. Interrupt-driven transmit / receive**
 
 For non-blocking operation, register a no-argument callback on a GDO pin and
-let the EXTI dispatcher in `cc1101_port.c` wake your code. ISRs stay tiny —
+let the EXTI dispatcher in `cc1101_port.c` wake your code. ISRs stay tiny, since
 they only flip a flag that the main loop polls.
 
 ```c
@@ -212,7 +242,7 @@ if (rx_ready) {
 }
 ```
 
-**Current `main.c` receive block** — interrupt-driven, displays packets on OLED:
+**Current `main.c` receive block**, interrupt-driven, displays packets on the OLED:
 
 ```c
 static volatile bool cc1101_rx_ready = false;
@@ -243,7 +273,7 @@ if (cc1101_radio1 && cc1101_rx_ready) {
 ```
 
 The `uitoa()` helper (already in `main.c`) is used throughout for converting
-numbers to ASCII without pulling `<stdio.h>` (saves several kB of flash).
+numbers to ASCII without pulling in `<stdio.h>` (saves several kB of flash).
 
 ---
 
@@ -284,29 +314,29 @@ RSSI: -75 dBm  LQI:120 ← RSSI + link quality
 ```
 Core/
  ├── Inc/
- │    ├── config.h          — feature toggles
- │    ├── main.h            — pin definitions
- │    ├── stm32c0xx_it.h    — IRQ declarations
+ │    ├── config.h         feature toggles
+ │    ├── main.h           pin definitions
+ │    ├── stm32c0xx_it.h   IRQ declarations
  │    └── ...
  ├── Src/
- │    ├── main.c            — init loop, EXTI callbacks, OLED display
- │    ├── stm32c0xx_it.c    — EXTI/UART/DMA IRQ handlers
+ │    ├── main.c           init loop, EXTI callbacks, OLED display
+ │    ├── stm32c0xx_it.c   EXTI/UART/DMA IRQ handlers
  │    └── ...
 Drivers/
   ├── CC1101/
-  │    ├── cc1101.h          — register map, enums, cc1101_t, public API
-  │    ├── cc1101.c          — protocol logic (SPI regs, freq/power, TX/RX)
-  │    ├── cc1101_port.h     — STM32 HAL glue declarations
-  │    └── cc1101_port.c     — HAL glue: SPI/GPIO/timing, EXTI registry
+  │    ├── cc1101.h        register map, enums, cc1101_t, public API
+  │    ├── cc1101.c        protocol logic (SPI regs, freq/power, TX/RX)
+  │    ├── cc1101_port.h   STM32 HAL glue declarations
+  │    └── cc1101_port.c   HAL glue: SPI/GPIO/timing, EXTI registry
   ├── OLED/
- │    ├── ssd1306.c         — I2C OLED controller
- │    └── ssd1306.h
- ├── TMP102/
- │    ├── tmp102.c          — I2C temperature sensor
- │    └── tmp102.h
- └── WS2812B/
-      ├── ws2812.c          — PWM+DMA addressable LED driver
-      └── ws2812.h
+  │    ├── ssd1306.c       I2C OLED controller
+  │    └── ssd1306.h
+  ├── TMP102/
+  │    ├── tmp102.c        I2C temperature sensor
+  │    └── tmp102.h
+  └── WS2812B/
+       ├── ws2812.c        PWM+DMA addressable LED driver
+       └── ws2812.h
 ```
 
 ---
@@ -331,10 +361,14 @@ only after the GDO signal is configured in `set_receive_action` /
 
 ## Building
 
-Open the project in **STM32CubeIDE** (the `.cproject` / `.project` files are included). Build the **Debug** configuration and flash via the on-board debugger (SWD) or USB-UART bootloader.
+Open the project in **STM32CubeIDE** (the `.cproject` / `.project` files are
+included). Build the **Debug** configuration and flash via the on-board debugger
+(SWD) or the USB-UART bootloader.
 
 ---
 
 ## License
 
-STMicroelectronics HAL drivers are used under ST's license terms (included with STM32CubeIDE).
+This project is licensed under the GNU General Public License v3.0 (see
+[LICENSE](LICENSE)). The STMicroelectronics HAL drivers are used under ST's
+license terms (included with STM32CubeIDE).
